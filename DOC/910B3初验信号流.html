@@ -3,206 +3,346 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Hyperloop · 910B3 单卡初验信号流</title>
+<title>Hyperloop 验证信号流回放</title>
 <style>
-:root {
-  color-scheme: light;
-  --bg: #f5f7fa;
-  --panel: #fff;
-  --ink: #142238;
-  --muted: #47576c;
-  --line: #cdd8e4;
-  --link: #225382;
-  --soft: #e8f2fa;
-  --real: #36563b;
-  --real-bg: #e8f4e6;
-  --replay: #814a12;
-  --replay-bg: #fbedd9;
-  --warn: #7b3540;
-  --warn-bg: #faeeeb;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    color-scheme: dark;
-    --bg: #111b29;
-    --panel: #182638;
-    --ink: #e6eef8;
-    --muted: #b5c6da;
-    --line: #3d536d;
-    --link: #9ecbf4;
-    --soft: #203750;
-    --real: #a5d39f;
-    --real-bg: #243a31;
-    --replay: #f5c487;
-    --replay-bg: #3c2e25;
-    --warn: #f5a99f;
-    --warn-bg: #462f35;
-  }
-}
-* { box-sizing: border-box; }
-html { scroll-padding-top: 1rem; }
-body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 system-ui, "Microsoft YaHei", sans-serif; }
-main { max-width: 1110px; padding: 34px 24px 48px; margin: auto; }
-h1 { margin: 0 0 8px; font-size: clamp(25px, 4vw, 42px); line-height: 1.2; letter-spacing: -.02em; }
-h2 { margin: 0 0 8px; font-size: 21px; }
-h3 { margin: 0; font-size: 16px; }
-p { margin: 0; }
-a { color: var(--link); text-underline-offset: 3px; }
-a:focus-visible, summary:focus-visible { outline: 2px solid var(--link); outline-offset: 3px; }
-code { font: .95em ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
-.lead { color: var(--muted); max-width: 750px; }
-.nav { display: flex; flex-wrap: wrap; gap: 7px 18px; margin: 12px 0 20px; font-size: 14px; }
-.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 11px; margin: 0 0 13px; padding: 16px 19px; }
-.panel-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px 12px; }
-.label { display: inline-block; border-radius: 5px; padding: 2px 6px; background: var(--soft); color: var(--link); font-size: 12px; font-weight: 680; }
-.label[data-type="real"] { background: var(--real-bg); color: var(--real); }
-.label[data-type="replay"] { background: var(--replay-bg); color: var(--replay); }
-.label[data-type="failure"] { background: var(--warn-bg); color: var(--warn); }
-.note { color: var(--muted); margin: 3px 0 9px; }
-.facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0; }
-.facts div { min-width: 0; padding: 8px 10px; background: var(--bg); border-radius: 6px; }
-.facts dt { color: var(--muted); font-size: 13px; }
-.facts dd { margin: 2px 0 0; font-weight: 620; overflow-wrap: anywhere; }
-.flow { display: grid; gap: 5px; list-style: none; margin: 0; padding: 0; }
-.handoff, .flow-head { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.7fr) minmax(0, 1fr); align-items: stretch; gap: 7px; }
-.flow-head { margin-bottom: 5px; color: var(--muted); font-size: 12px; }
-.flow-head span:nth-child(2) { text-align: center; }
-.node { display: grid; align-content: center; padding: 7px 9px; min-width: 0; border: 1px solid var(--line); border-radius: 6px; font-size: 13px; font-weight: 650; overflow-wrap: anywhere; }
-.node[data-type="real"] { border-left: 3px solid var(--real); background: var(--real-bg); color: var(--real); }
-.node[data-type="replay"] { border-left: 3px solid var(--replay); background: var(--replay-bg); color: var(--replay); }
-.message { display: grid; justify-items: center; align-content: center; gap: 2px; padding: 4px 2px; font-size: 13px; text-align: center; overflow-wrap: anywhere; }
-.message::after { content: ""; width: min(54px, 100%); height: 6px; background: var(--link); clip-path: polygon(0 36%, calc(100% - 6px) 36%, calc(100% - 6px) 0, 100% 50%, calc(100% - 6px) 100%, calc(100% - 6px) 64%, 0 64%); }
-details { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 8px; }
-summary { cursor: pointer; color: var(--link); font-weight: 620; }
-details p, .links { margin-top: 6px; }
-.links { display: flex; flex-wrap: wrap; gap: 6px 16px; }
-.gates { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 8px; }
-.gates article { border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; min-width: 0; }
-.gates p { color: var(--muted); }
-@media (max-width: 680px) {
-  main { padding: 22px 12px 30px; }
-  .panel { padding: 12px; }
-  .facts, .gates { grid-template-columns: minmax(0, 1fr); }
-  .handoff, .flow-head { grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr) minmax(0, 1fr); gap: 4px; }
-  .node { padding: 5px 4px; }
-  .node, .message { font-size: 12px; }
-}
+:root{color-scheme:light dark;--bg:#eef3f8;--paper:#fff;--ink:#10243a;--muted:#4a6178;--line:#c1cfdd;--lane:#f3f7fb;--edge:#59758f;--active:#067663;--on:#fff;--focus:#0066b6;--soft:#e1f3ed;--fixed:#8a5515;--mock:#6948a2;--logic:#2763ab}
+@media(prefers-color-scheme:dark){:root{--bg:#101a26;--paper:#172637;--ink:#eaf1f8;--muted:#acc1d5;--line:#465b70;--lane:#1b2d40;--edge:#9fb4cb;--active:#70e2c4;--on:#10243a;--focus:#8fcaff;--soft:#203e3c;--fixed:#f2bb70;--mock:#c6b1ff;--logic:#9ac8ff}}
+*{box-sizing:border-box}body{background:var(--bg);color:var(--ink);font:16px/1.55 "Microsoft YaHei","Noto Sans SC",system-ui,sans-serif;margin:0}
+main{max-width:1450px;margin:auto;padding:24px 22px 44px}h1,h2,p{margin:0}h1{font-size:clamp(1.5rem,3vw,2.2rem);line-height:1.2}h2{font-size:1.14rem}.lede{color:var(--muted);margin-top:9px;max-width:80ch}
+a{color:var(--focus);text-underline-offset:.16em}.links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:9px;font-size:.91rem}
+.panel{background:var(--paper);border:1px solid var(--line);border-radius:12px;margin-top:15px;padding:14px}.panel p + p{margin-top:6px}
+.scenes,.control-row,.scene-result{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.scenes{margin-bottom:10px}.scene-result{column-gap:17px}.scene-result .links{margin-top:0}
+button{font:inherit;color:var(--ink);background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:5px 12px;cursor:pointer;min-height:38px}
+button:hover{border-color:var(--focus)}button:disabled{cursor:default;opacity:.44}button[aria-pressed=true],.play{color:var(--on);background:var(--active);border-color:var(--active)}
+:focus-visible{outline:3px solid var(--focus);outline-offset:3px}
+.control-row{margin-top:10px}.seek{min-width:170px;display:flex;align-items:center;gap:8px;flex:1;font-size:.93rem;color:var(--muted)}.seek input{min-width:80px;flex:1;accent-color:var(--active)}
+.readout{border-top:1px solid var(--line);display:grid;grid-template-columns:max-content minmax(0,1fr);gap:2px 10px;margin-top:10px;padding-top:9px}.readout .meta{grid-column:1/-1;margin-top:0}
+.actors{font-weight:700}.message{overflow-wrap:anywhere}.meta{color:var(--muted);font-size:.88rem}.kind{font-weight:700}
+[data-kind=real_execution]{color:var(--active)}[data-kind=fixture]{color:var(--fixed)}[data-kind=simulation]{color:var(--mock)}[data-kind=project_logic]{color:var(--logic)}
+.graph-viewport{overflow:auto;border:1px solid var(--line);border-radius:8px;margin-top:12px;background:var(--paper)}
+#diagram{width:100%;min-width:830px;height:auto;display:block}.lane{fill:var(--lane);stroke:var(--line);stroke-width:1}.lane-title{fill:var(--muted);font-weight:700;font-size:12px}
+.edge{fill:none;stroke:var(--edge);stroke-width:1.35;opacity:.29;stroke-linejoin:round}.head{fill:var(--edge);opacity:.75}.active-head{fill:var(--active)}
+.node rect{fill:var(--paper);stroke:var(--line);stroke-width:1.3}.node text{fill:var(--ink);font-size:13px}.node .sub{fill:var(--muted);font-size:11px}
+.node[data-used=false]{opacity:.44}.node[data-phase=sender] rect,.node[data-phase=receiver] rect{fill:var(--soft);stroke:var(--active);stroke-width:2.5}
+.node[data-phase=sender] .sub,.node[data-phase=receiver] .sub{fill:var(--active);font-weight:700}
+#signal-edge{fill:none;stroke:var(--active);stroke-width:3;stroke-linejoin:round}.pulse{fill:var(--active);stroke:var(--paper);stroke-width:2}.pulse[hidden]{display:none}.label-lead{stroke:var(--active);stroke-width:1.4}
+.label-bg{fill:var(--paper);stroke:var(--active);stroke-width:1.7}.label-text{fill:var(--ink);font-size:13px;font-weight:650}
+.figure-note{font-size:.84rem;color:var(--muted);margin-top:7px}
+details{margin-top:13px}summary{cursor:pointer;font-weight:700}#steps{padding-left:1.7rem;margin:8px 0;max-height:24rem;overflow:auto}
+#steps li{padding:2px 2px 2px 4px}#steps button{display:block;text-align:left;width:100%;min-height:36px;padding:4px 8px;font-size:.9rem}#steps button[aria-current=true]{background:var(--soft);border-color:var(--active)}
+.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;margin-top:8px;font-size:.89rem}th,td{border-bottom:1px solid var(--line);padding:6px 9px;text-align:left;vertical-align:top}th{background:var(--lane)}
+code{font-family:ui-monospace,Consolas,monospace;font-size:.9em}
+@media(max-width:720px){main{padding:16px 10px 25px}.panel{padding:10px}.control-row{gap:6px}.seek{flex-basis:100%}.readout{grid-template-columns:minmax(0,1fr)}#diagram{min-width:875px}}
 </style>
 </head>
 <body>
 <main>
-  <header>
-    <h1>Hyperloop · 910B3 单卡初验</h1>
-    <p class="lead">独立启动原版，锁定固定输入的输出 token。正式会话先测原版，再用同一输入校验参数候选，校验通过才计时。</p>
-    <nav class="nav" aria-label="验证导航">
-      <a href="#result">本次结果</a>
-      <a href="#input">验证输入</a>
-      <a href="#reference">采集参考</a>
-      <a href="#dispatch">任务派发</a>
-      <a href="#measure">真机评测</a>
-      <a href="#decision">如何裁决</a>
-      <a href="优化任务与交付架构.html">项目总图</a>
-    </nav>
-  </header>
-
-  <section class="panel" id="result" aria-labelledby="result-title">
-    <div class="panel-header">
-      <h2 id="result-title">本次结果</h2>
-      <!-- BEGIN RUN STATUS -->
-      <span id="result-status" class="label" data-type="real">真机会话已完成 · 0a30626</span>
-      <!-- END RUN STATUS -->
-    </div>
-    <!-- BEGIN RUN RESULTS -->
-    <dl class="facts">
-      <div><dt>配对父版 · 分块 512</dt><dd id="result-baseline">96.77 tok/s · 首 token 202.45 ms</dd></div>
-      <div><dt>R01 · 分块 256</dt><dd id="result-candidate">83.40 tok/s · 首 token 374.39 ms</dd></div>
-      <div><dt>版本裁决</dt><dd id="result-verdict">REVERT · 保留 512</dd></div>
-    </dl>
-    <p class="note" id="result-scope">四组输出 token 全部一致。候选首 token 延迟增加 84.93%，超过 10% 上限。单独跑的原始基线为 96.24 tok/s。</p>
-    <!-- END RUN RESULTS -->
-    <div class="links" id="result-links">
-      <a href="910B3部署与初验.md">迁移与部署日志</a>
-      <!-- BEGIN RUN EVIDENCE -->
-      <a href="../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#validation">实际会话交接</a>
-      <a href="../.runs/910b3-initial/20261124-0a30626-02/reference/capture.json">参考采集回执</a>
-      <a href="../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0002-p0/paired_comparison.json">配对指标与差异</a>
-      <a href="../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evidence/decisions/task-0002-R01.json">独立裁决</a>
-      <!-- END RUN EVIDENCE -->
-    </div>
-  </section>
-
-  <section class="panel" id="input" aria-labelledby="input-title">
-    <h2 id="input-title">验证输入</h2>
-    <!-- BEGIN RUN INPUTS -->
-    <dl class="facts">
-      <div><dt>环境</dt><dd id="input-environment">910B3 单卡 · SGLang 0.5.16 · Qwen2.5-0.5B · BF16</dd></div>
-      <div><dt>请求</dt><dd id="input-requests">两组长输入、两组短输入 · 并发 2 · 每版 3 轮</dd></div>
-      <div><dt>比较对象</dt><dd id="input-parameters">原始分块 512 与 R01 分块 256</dd></div>
-    </dl>
-    <!-- END RUN INPUTS -->
-    <p class="note">出发前锁定输入和门槛。四组输出须完全一致，吞吐至少提高 5%，两项延迟各最多增加 10%。</p>
-  </section>
-
-  <section class="panel" id="reference" aria-labelledby="reference-title">
-    <div class="panel-header">
-      <h2 id="reference-title">独立采集原版 Reference</h2>
-      <span class="label" data-type="real">真机路径</span>
-    </div>
-    <ol class="flow">
-      <li class="handoff"><span class="node">评测器 Evaluator</span><span class="message">原版配置与固定输入</span><span class="node" data-type="real">隔离启动的 SGLang</span></li>
-      <li class="handoff"><span class="node" data-type="real">SGLang <code>/generate</code></span><span class="message">逐请求输出 token ID</span><span class="node">参考输出采集</span></li>
-      <li class="handoff"><span class="node">参考输出采集</span><span class="message">参考输出、身份与原始响应</span><span class="node">独立参考证据</span></li>
-    </ol>
-    <p class="note">采集完成后关闭参考服务。正式会话另起实例，用已保存的输出做对照。</p>
-  </section>
-
-  <section class="panel" id="dispatch" aria-labelledby="dispatch-title">
-    <div class="panel-header">
-      <h2 id="dispatch-title">登记与派发</h2>
-      <span class="label" data-type="replay">候选由固定回复提交</span>
-    </div>
-    <div class="flow-head" aria-hidden="true"><span>发送方</span><span>交接内容</span><span>接收方</span></div>
-    <ol class="flow">
-      <li class="handoff"><span class="node">Coordinator</span><span class="message">内部任务 · 测原始基线</span><span class="node">Intent Router</span></li>
-      <li class="handoff"><span class="node" data-type="replay">Orchestration 回放</span><span class="message">直接委派 · 试预写的参数候选</span><span class="node">Intent Router</span></li>
-      <li class="handoff"><span class="node">Intent Router</span><span class="message">核对权限、阶段和参数，登记入队</span><span class="node">Dispatcher</span></li>
-      <li class="handoff"><span class="node">Dispatcher</span><span class="message">预算及资源允许，启动基线或 Explore</span><span class="node">执行模块与 Evaluator</span></li>
-    </ol>
-    <p class="note">基线先完成后再登记参数候选。调参走直接委派，测后由独立裁决复核证据。</p>
-  </section>
-
-  <section class="panel" id="measure" aria-labelledby="measure-title">
-    <div class="panel-header">
-      <h2 id="measure-title">SGLang 真机校验与计时</h2>
-      <span class="label" data-type="real">样本来自 NPU 服务</span>
-    </div>
-    <ol class="flow">
-      <li class="handoff"><span class="node">Evaluator</span><span class="message">明确版本、启动参数和待测请求</span><span class="node" data-type="real">SGLang 适配器</span></li>
-      <li class="handoff"><span class="node" data-type="real">SGLang 适配器</span><span class="message">固定输入 token 与生成长度</span><span class="node" data-type="real">SGLang <code>/generate</code></span></li>
-      <li class="handoff"><span class="node" data-type="real">SGLang <code>/generate</code></span><span class="message">输出 token IDs 与实际请求长度</span><span class="node">Verifier 正确性检查</span></li>
-      <li class="handoff"><span class="node">Verifier</span><span class="message">确认版本与 Reference 匹配，才开始计时</span><span class="node">BenchmarkRunner</span></li>
-      <li class="handoff"><span class="node" data-type="real">SGLang <code>/generate</code></span><span class="message">服务返回流式响应，客户端记录首 token 与完成时间</span><span class="node">BenchmarkRunner</span></li>
-      <li class="handoff"><span class="node">Verifier 与 BenchmarkRunner</span><span class="message">输出核验、重复样本和环境身份</span><span class="node">Session 证据</span></li>
-    </ol>
-    <p class="note">R01 校验并计时后，另起分块 512 的父版服务，按同一输入和计时规则重测。译码结果与原始参考逐 token 一致。</p>
-    <details>
-      <summary>三项指标从哪里来</summary>
-      <p>吞吐用整个测量窗口内的生成 token 数计算。TTFT 是请求到首个输出 token 的时间，TPOT 是首个 token 后平均每个 token 的时间。</p>
-    </details>
-  </section>
-
-  <section class="panel" id="decision" aria-labelledby="decision-title">
-    <h2 id="decision-title">独立裁决与会话报告</h2>
-    <ol class="flow">
-      <li class="handoff"><span class="node">Session 证据</span><span class="message">读原始版、父版、候选与锁定门槛</span><span class="node">独立裁决</span></li>
-      <li class="handoff"><span class="node">独立裁决</span><span class="message">KEEP、REVERT 或 HOLD，附理由</span><span class="node">Coordinator 写回</span></li>
-      <li class="handoff"><span class="node">Coordinator 写回</span><span class="message">存版本决定、事件与报告链接</span><span class="node">Session 报告</span></li>
-    </ol>
-    <div class="gates">
-      <article><h3>正确性</h3><p>固定请求的输出须匹配独立 Reference。失败即退回候选并跳过性能计时。</p></article>
-      <article><h3>性能与证据</h3><p>同条件复测，收益达标且守住延迟门槛才保留。回归或收益不足予以退回。证据不足时暂缓裁决。</p></article>
-    </div>
-  </section>
+<header>
+<h1>Hyperloop 验证信号流回放</h1>
+<p class="lede">在同一张图上，按实际记录回放 910B3 初验、GEAK 和 Forge 模拟，以及异常分支。</p>
+<div class="links"><a href="910B3部署与初验.md">部署与结果</a><a href="优化任务与交付架构.html">项目架构总图</a><a href="#coverage">逐部件覆盖</a></div>
+</header>
+<section class="panel" id="result" aria-label="选择可播放的会话">
+<div class="scenes" id="scenes" role="group" aria-label="会话"></div>
+<div class="scene-result"><p id="scenario-summary"></p><div class="links" id="scenario-links"></div></div>
+<div class="control-row" aria-label="播放控制">
+<button type="button" id="play" class="play">播放</button>
+<button type="button" id="prev">上一步</button>
+<button type="button" id="next">下一步</button>
+<label class="seek" for="seek">定位 <input id="seek" type="range" min="1" max="1" value="1"></label>
+<output id="counter" for="seek">1 / 1</output>
+</div>
+<div class="readout" aria-live="polite" aria-atomic="true" id="readout">
+<div id="actors" class="actors"></div>
+<p id="message" class="message"></p>
+<p class="meta"><span id="step-phase"></span> <span class="kind" id="kind"></span> <a id="evidence" hidden>查看本步证据</a> <a id="corroboration" hidden>查看补充证据</a></p>
+</div>
+<div class="graph-viewport" tabindex="0" aria-label="同一张部件图，窄屏可横向滚动">
+<svg id="diagram" viewBox="0 0 1320 563" aria-labelledby="graph-title graph-desc" role="img">
+<title id="graph-title">Hyperloop 部件与交接箭头</title>
+<desc id="graph-desc">全部部件在同一张图。播放时信号沿当前箭头移向接收方，箭头旁显示这一步的具体消息。交接信息也列于图上方。</desc>
+<defs>
+<marker id="head" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path class="head" d="M0 0L8 4L0 8Z"/></marker>
+<marker id="active-head" markerWidth="11" markerHeight="11" refX="10" refY="5.5" orient="auto" markerUnits="userSpaceOnUse"><path class="active-head" d="M0 0L11 5.5L0 11Z"/></marker>
+</defs>
+<g id="lanes"></g><g id="edges"></g>
+<path id="signal-edge" marker-end="url(#active-head)"/>
+<g id="nodes"></g>
+<circle id="pulse" class="pulse" r="6" hidden/>
+<g id="edge-label"><line class="label-lead"/><rect class="label-bg" rx="7"/><text class="label-text" text-anchor="middle"></text></g>
+</svg>
+</div>
+<p class="figure-note">亮线对应当前步骤，箭头上的标签是这一步交接的内容。浅色箭头表示这个案例的其他方向。回放按证据顺序展示关键交接，完整请求和逐轮记录可在原始报告中展开。</p>
+<details>
+<summary>全部步骤与证据</summary>
+<ol id="steps"></ol>
+</details>
+<noscript><p>启用 JavaScript 可在这张图上逐步回放。<a href="910B3部署与初验.md">查看初验结果和原始证据</a>。</p></noscript>
+</section>
+<section class="panel" id="coverage">
+<h2>哪些部件已经验证</h2>
+<p class="lede">每个部件按本轮证据标出使用情况。「实机」表示实际 910B3 的运行或该会话里的程序交接。预写回复和模拟工具在表里单独标记。</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th scope="col">部件</th><th scope="col">910B3 初验</th><th scope="col">GEAK 模拟</th><th scope="col">Forge 模拟</th><th scope="col">异常分支模拟</th></tr></thead>
+<tbody id="coverage-rows"></tbody>
+</table>
+</div>
+<p class="meta" id="coverage-note"></p>
+<details>
+<summary>补救、恢复与收尾补测</summary>
+<p>补充模拟验证覆盖初始服务启动失败后的补救、从已有回执恢复，以及收尾发现整栈证据失效后补测。还用本地测试检查缺 rank、清理未确认和扫描只完成部分配对时的处理。</p>
+<div class="links"><a href="../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#validation">异常分支模拟会话</a><a href="../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/coverage-result.json">补救、恢复、补测证据</a><a href="../.runs/component-coverage-current-unittest.txt">当前版本回归测试</a></div>
+</details>
+<div class="links"><a href="通用底稿初步规划.md">接口与目标范围</a><a href="Agent执行架构图.html">阶段与实现说明</a></div>
+</section>
 </main>
+<script id="trace-data" type="application/json">{"scenarios":[{"id":"real","label":"910B3 真机 · R01 参数复测","mode":"real","report":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#validation","steps":[{"from":"input","to":"reference","message":"冻结 910B3、Qwen2.5-0.5B、BF16、TP=1 与四组固定输入 token ID","evidence":"../.runs/910b3-initial/20261124-0a30626-02/reference/evaluation/reference-capture/workload.json","phase":"采集独立参考","provenance":"project_logic"},{"from":"reference","to":"runtime","message":"通过评测器准备独立参考实例，原始分块大小 512","evidence":"../.runs/910b3-initial/20261124-0a30626-02/reference/evaluation/reference-capture/reference_launch.json","phase":"采集独立参考","provenance":"real_execution"},{"from":"runtime","to":"sglang","message":"对独立参考实例发起四次非流式 POST /generate","evidence":"../.runs/910b3-initial/20261124-0a30626-02/reference/evaluation/reference-capture/reference_service_outputs.json","phase":"采集独立参考","provenance":"real_execution"},{"from":"sglang","to":"runtime","message":"返回四组完整输出 token ID 和实际请求长度","evidence":"../.runs/910b3-initial/20261124-0a30626-02/reference/evaluation/reference-capture/reference_service_outputs.json","phase":"采集独立参考","provenance":"real_execution"},{"from":"reference","to":"evidence","message":"独立实例已释放（10.56 秒），封存参考 token 与环境指纹","evidence":"../.runs/910b3-initial/20261124-0a30626-02/reference/capture.json","phase":"采集独立参考","provenance":"real_execution","corroboration":"../.runs/910b3-initial/20261124-0a30626-02/reference/evaluation/reference-capture/reference_cleanup.json"},{"from":"input","to":"coordinator","message":"提交锁定的工作负载、参考摘要、3 轮采样规则和 R01 参数任务","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/manifest.json","phase":"建立原始基线","provenance":"project_logic"},{"from":"coordinator","to":"router","message":"登记 PRELUDE 原始 baseline，版本 sglang-fdebc938-tp1","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-3","phase":"建立原始基线","provenance":"project_logic","event":3},{"from":"router","to":"policy","message":"检查 PRELUDE 是否允许内部 baseline 任务与当前参数","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-3","phase":"建立原始基线","provenance":"project_logic","event":3,"corroboration":"../src/hyperloop/router.py#L59"},{"from":"policy","to":"router","message":"内部任务准入通过，允许入队","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-3","phase":"建立原始基线","provenance":"project_logic","event":3,"corroboration":"../src/hyperloop/router.py#L68"},{"from":"router","to":"dispatcher","message":"原始 baseline 登记为 task-0001，状态 queued","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-3","phase":"建立原始基线","provenance":"project_logic","event":3},{"from":"dispatcher","to":"baseline","message":"启动 task-0001，分配评测与工作区资源","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-5","phase":"建立原始基线","provenance":"project_logic","event":5},{"from":"baseline","to":"evaluator","message":"固定工作点下测分块 512 的原始版，自独立参考核对输出","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0001/workload.json","phase":"建立原始基线","provenance":"project_logic"},{"from":"evaluator","to":"runtime","message":"启动不同于独立参考的新 SGLang 实例，核对已加载分块 512","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0001/revision_launch.json","phase":"建立原始基线","provenance":"real_execution"},{"from":"evaluator","to":"verifier","message":"使用冻结参考与 tolerance=0，逐 token 比对基线四组输出","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0001/revision_service_correctness.json","phase":"建立原始基线","provenance":"real_execution"},{"from":"benchmark","to":"evaluator","message":"基线 3 轮汇总：96.24 tok/s，TTFT 201.77 ms，TPOT 15.40 ms","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0001/revision_measurement.json","phase":"建立原始基线","provenance":"real_execution"},{"from":"dispatcher","to":"coordinator","message":"基线任务结束，登记基线结果；本轮 Profile 关闭","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-9","phase":"建立原始基线","provenance":"project_logic","event":9,"corroboration":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-11"},{"from":"coordinator","to":"orchestration","message":"发起框架轮，交付当前接受版、基线、目标和预算","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-14","phase":"R01 登记与派发","provenance":"project_logic","event":14},{"from":"orchestration","to":"router","message":"回放 R01 意图：委派 Explore，将 chunked_prefill_size 由 512 调至 256","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-15","phase":"R01 登记与派发","provenance":"fixture","event":15},{"from":"router","to":"dispatcher","message":"参数和阶段校验通过，登记 Explore task-0002","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-16","phase":"R01 登记与派发","provenance":"project_logic","event":16},{"from":"dispatcher","to":"explore","message":"启动 task-0002，携带 R01 及原始父版","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-20","phase":"R01 登记与派发","provenance":"project_logic","event":20},{"from":"explore","to":"evaluator","message":"同条件比较候选 256 与父版 512，保持其余配置与请求固定","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0002-p0/validation_flow.json","phase":"候选与父版复测","provenance":"project_logic"},{"from":"evaluator","to":"runtime","message":"拉起 R01 独立实例并确认加载分块 256","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0002-p0/candidate_launch.json","phase":"候选与父版复测","provenance":"real_execution"},{"from":"runtime","to":"sglang","message":"向 R01 发四组锁定输入，请求校验所需的完整 token ID","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0002-p0/candidate_service_outputs.json","phase":"候选与父版复测","provenance":"real_execution"},{"from":"sglang","to":"runtime","message":"返回 R01 的 token ID，四组输出均可逐 token 回查","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0002-p0/candidate_service_outputs.json","phase":"候选与父版复测","provenance":"real_execution"},{"from":"verifier","to":"evaluator","message":"R01 四组输出与参考完全一致，允许性能计时","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0002-p0/candidate_service_correctness.json","phase":"候选与父版复测","provenance":"real_execution"},{"from":"benchmark","to":"evaluator","message":"R01 3 轮汇总：83.40 tok/s，TTFT 374.39 ms，TPOT 22.53 ms","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0002-p0/candidate_measurement.json","phase":"候选与父版复测","provenance":"real_execution"},{"from":"runtime","to":"evaluator","message":"确认 R01 资源释放，再启动分块 512 的配对父版","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0002-p0/candidate_cleanup.json","phase":"候选与父版复测","provenance":"real_execution","corroboration":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0002-p0/parent_launch.json"},{"from":"verifier","to":"evaluator","message":"配对父版四组输出与参考完全一致，允许性能计时","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0002-p0/parent_service_correctness.json","phase":"候选与父版复测","provenance":"real_execution"},{"from":"benchmark","to":"evaluator","message":"配对父版 3 轮汇总：96.77 tok/s，TTFT 202.45 ms，TPOT 15.58 ms","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0002-p0/parent_measurement.json","phase":"候选与父版复测","provenance":"real_execution"},{"from":"evaluator","to":"evidence","message":"落盘配对差异：吞吐 -13.81%，TTFT +84.93%，TPOT +44.63%","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0002-p0/paired_comparison.json","phase":"独立裁决与交付","provenance":"project_logic"},{"from":"evidence","to":"verdict","message":"提交版本、正确性证据、原始样本与冻结门槛供独立重算","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evidence/decisions/task-0002-R01.json","phase":"独立裁决与交付","provenance":"project_logic"},{"from":"verdict","to":"coordinator","message":"REVERT · TTFT +84.93% 超过 10% 门槛，保留分块 512","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-25","phase":"独立裁决与交付","provenance":"project_logic","event":25},{"to":"close","message":"达到轮数上限，进入收尾检查，保留已验收版本","phase":"关闭与归档","provenance":"project_logic","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-33","event":33,"from":"coordinator"},{"to":"recipe","message":"保存当前有效配置、适用条件与证据引用","phase":"关闭与归档","provenance":"project_logic","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-35","event":35,"from":"close"},{"from":"close","to":"report","message":"轮数上限收尾 · Profile、算子与扫描这轮关闭 · 展示真实证据","evidence":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-38","phase":"独立裁决与交付","provenance":"project_logic","event":38,"corroboration":"../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#event-31"}]},{"id":"geak","label":"GEAK 模拟 · TP=2 编排演练","mode":"simulated","report":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#validation","steps":[{"from":"input","to":"coordinator","message":"载入模拟 TP=2 设备、固定输入、参考输出及候选脚本","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/manifest.json","phase":"原始基线与双 rank 采集","provenance":"fixture"},{"from":"coordinator","to":"router","message":"登记原始 base 的 baseline 任务","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-3","phase":"原始基线与双 rank 采集","provenance":"project_logic","event":3},{"from":"router","to":"dispatcher","message":"任务 task-0001 通过内部准入并入队","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-3","phase":"原始基线与双 rank 采集","provenance":"project_logic","event":3},{"from":"dispatcher","to":"baseline","message":"启动模拟基线；评测将服务计时与模型 forward 分开存证","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-5","phase":"原始基线与双 rank 采集","provenance":"project_logic","event":5},{"from":"baseline","to":"evaluator","message":"比较固定输出与参考，基线端到端吞吐为 100 tok/s","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/evaluation/task-0001/revision_measurement.json","phase":"原始基线与双 rank 采集","provenance":"simulation"},{"from":"dispatcher","to":"profiler","message":"启动 Profile task-0002，采集 rank 0 与 rank 1","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-13","phase":"原始基线与双 rank 采集","provenance":"project_logic","event":13},{"from":"profiler","to":"runtime","message":"发起模拟 trace 采集，分别保存两个 rank 的原始 trace","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/evaluation/task-0002/profile_raw.json","phase":"原始基线与双 rank 采集","provenance":"simulation"},{"from":"evaluator","to":"trace_analyzer","message":"送入两 rank 的 trace，检查来源后识别 Attention 热点","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/evaluation/task-0002/validation_flow.json","phase":"原始基线与双 rank 采集","provenance":"project_logic"},{"from":"trace_analyzer","to":"evaluator","message":"返回 Attention 热点：rank 0 为 90 μs，rank 1 为 91 μs，shape 4096×128","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/evaluation/task-0002/profile_analysis.json","phase":"原始基线与双 rank 采集","provenance":"simulation"},{"from":"coordinator","to":"orchestration","message":"交付已接受 base、模拟 Attention 热点与剩余预算","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-21","phase":"R01 调参","provenance":"project_logic","event":21},{"from":"orchestration","to":"router","message":"回放 R01：委派 Explore，设置 chunked_prefill_size=4096","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-22","phase":"R01 调参","provenance":"fixture","event":22},{"from":"router","to":"dispatcher","message":"准入通过，直接登记 Explore task-0003","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-23","phase":"R01 调参","provenance":"project_logic","event":23,"corroboration":"../src/hyperloop/router.py#L83"},{"from":"dispatcher","to":"explore","message":"下发 R01 调参任务和锁定负载","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-27","phase":"R01 调参","provenance":"project_logic","event":27},{"from":"explore","to":"evaluator","message":"分别校验并测 R01 和配对父版 base，形成服务比较","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/evaluation/task-0003-p0/validation_flow.json","phase":"R01 调参","provenance":"simulation"},{"from":"verdict","to":"coordinator","message":"R01 正确性和性能门通过，KEEP；接受版吞吐 110 tok/s","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-32","phase":"R01 调参","provenance":"project_logic","event":32},{"from":"orchestration","to":"router","message":"回放 Specialist 委派，调查 Attention 调用路径","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-44","phase":"R02 补丁与审批","provenance":"fixture","event":44},{"from":"router","to":"dispatcher","message":"登记专项任务 task-0005，模式 author","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-45","phase":"R02 补丁与审批","provenance":"project_logic","event":45},{"from":"dispatcher","to":"specialist","message":"启动专项任务，交付当前版和 Attention 调用路径调查","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-49","phase":"R02 补丁与审批","provenance":"project_logic","event":49},{"from":"specialist","to":"router","message":"经 Coordinator 提交回放提案 R02，补丁路径占位 sglang/attention.py","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-54","phase":"R02 补丁与审批","provenance":"fixture","event":54},{"from":"router","to":"critic","message":"登记 review-R02 为 pending，关联提交人、父版 R01 和候选范围","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-55","phase":"R02 补丁与审批","provenance":"project_logic","event":55},{"from":"critic","to":"router","message":"回放批准 review-R02，携带评审理由","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-60","phase":"R02 补丁与审批","provenance":"fixture","event":60},{"from":"router","to":"dispatcher","message":"审批放行后登记补丁集成 task-0006","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-62","phase":"R02 补丁与审批","provenance":"project_logic","event":62},{"from":"dispatcher","to":"integrate","message":"执行 R02 占位补丁的候选集成；隔离加载由模拟后端返回","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-66","phase":"R02 补丁与审批","provenance":"project_logic","event":66},{"from":"integrate","to":"evaluator","message":"送整套 R01+R02 模拟候选校验并与配对父版比较","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/evaluation/task-0006/validation_flow.json","phase":"R02 补丁与审批","provenance":"simulation"},{"from":"verdict","to":"coordinator","message":"R02 通过判据，KEEP；接受版吞吐 115 tok/s","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-71","phase":"R02 补丁与审批","provenance":"project_logic","event":71},{"from":"coordinator","to":"router","message":"进入算子阶段，登记 kernel_agent · backend=geak","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-83","phase":"GEAK 算子与整栈复测","provenance":"project_logic","event":83},{"from":"dispatcher","to":"kernel","message":"启动 task-0007，按 GEAK 契约读取有效 Profile 和已接受的 R01、R02","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-85","phase":"GEAK 算子与整栈复测","provenance":"project_logic","event":85},{"from":"kernel","to":"geak","message":"按 GEAK 模拟契约交目标 R02、Profile、负载、两个候选 K-GEAK 与 R03","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/evidence/kernel/task-0007-handoff.json","phase":"GEAK 算子与整栈复测","provenance":"simulation"},{"from":"geak","to":"evaluator","message":"模拟校验后发布可加载整栈、分块 4096 和工具侧服务样本 122 tok/s","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/evidence/kernel/task-0007-k0-geak-publication.json","phase":"GEAK 算子与整栈复测","provenance":"simulation","corroboration":"../.runs/full-flow-visual/replay/simulated/geak-tp2/evaluation/task-0007-k0-tool/device_timing.json"},{"from":"evaluator","to":"verifier","message":"核对模拟加载组合 R01 + R02 + K-GEAK，先比算子输出、再比服务输出","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/evaluation/task-0007-k0/candidate_launch.json","phase":"GEAK 算子与整栈复测","provenance":"simulation","corroboration":"../.runs/full-flow-visual/replay/simulated/geak-tp2/evaluation/task-0007-k0/validation_flow.json"},{"from":"benchmark","to":"evaluator","message":"独立重测候选整栈和父版，候选端到端模拟吞吐 122 tok/s","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/evaluation/task-0007-k0/candidate_measurement.json","phase":"GEAK 算子与整栈复测","provenance":"simulation"},{"from":"verdict","to":"coordinator","message":"K-GEAK KEEP；R03 仅比父版增益 0.82%，REVERT","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-93","phase":"GEAK 算子与整栈复测","provenance":"project_logic","event":93,"corroboration":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-90"},{"from":"coordinator","to":"sweep","message":"经 Router 入队并由 Dispatcher 启动 SWEEP，分别在并发 1/4/8 比较原版和接受整栈","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-98","phase":"并发扫描与收尾","provenance":"project_logic","event":98},{"from":"sweep","to":"coordinator","message":"返还三档模拟配对扫描，记录完成后允许回到框架阶段","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-104","phase":"并发扫描与收尾","provenance":"simulation","event":104,"corroboration":"../.runs/full-flow-visual/replay/simulated/geak-tp2/evidence/sweep/task-0008.json"},{"to":"close","message":"达到轮数上限，进入收尾检查，保留已验收版本","phase":"关闭与归档","provenance":"project_logic","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-130","event":130,"from":"coordinator"},{"to":"recipe","message":"保存当前有效配置、适用条件与证据引用","phase":"关闭与归档","provenance":"project_logic","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-132","event":132,"from":"close"},{"from":"close","to":"report","message":"第二轮无新接受改动，后续扫描跳过；轮数上限收尾，输出整栈报告、失败原因与 Recipe","evidence":"../.runs/full-flow-visual/replay/simulated/geak-tp2/report.html#event-135","phase":"并发扫描与收尾","provenance":"project_logic","event":135}]},{"id":"forge","label":"Forge 模拟 · TP=2 编排演练","mode":"simulated","report":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#validation","steps":[{"from":"input","to":"coordinator","message":"载入模拟 TP=2 设备、固定输入、参考输出及候选脚本","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/manifest.json","phase":"原始基线与双 rank 采集","provenance":"fixture"},{"from":"coordinator","to":"router","message":"登记原始 base 的 baseline 任务","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-3","phase":"原始基线与双 rank 采集","provenance":"project_logic","event":3},{"from":"router","to":"dispatcher","message":"任务 task-0001 通过内部准入并入队","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-3","phase":"原始基线与双 rank 采集","provenance":"project_logic","event":3},{"from":"dispatcher","to":"baseline","message":"启动模拟基线；评测将服务计时与模型 forward 分开存证","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-5","phase":"原始基线与双 rank 采集","provenance":"project_logic","event":5},{"from":"baseline","to":"evaluator","message":"比较固定输出与参考，基线端到端吞吐为 100 tok/s","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/evaluation/task-0001/revision_measurement.json","phase":"原始基线与双 rank 采集","provenance":"simulation"},{"from":"dispatcher","to":"profiler","message":"启动 Profile task-0002，采集 rank 0 与 rank 1","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-13","phase":"原始基线与双 rank 采集","provenance":"project_logic","event":13},{"from":"profiler","to":"runtime","message":"发起模拟 trace 采集，分别保存两个 rank 的原始 trace","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/evaluation/task-0002/profile_raw.json","phase":"原始基线与双 rank 采集","provenance":"simulation"},{"from":"evaluator","to":"trace_analyzer","message":"送入两 rank 的 trace，检查来源后识别 Attention 热点","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/evaluation/task-0002/validation_flow.json","phase":"原始基线与双 rank 采集","provenance":"project_logic"},{"from":"trace_analyzer","to":"evaluator","message":"返回 Attention 热点：rank 0 为 90 μs，rank 1 为 91 μs，shape 4096×128","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/evaluation/task-0002/profile_analysis.json","phase":"原始基线与双 rank 采集","provenance":"simulation"},{"from":"coordinator","to":"orchestration","message":"交付已接受 base、模拟 Attention 热点与剩余预算","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-21","phase":"R01 调参","provenance":"project_logic","event":21},{"from":"orchestration","to":"router","message":"回放 R01：委派 Explore，设置 chunked_prefill_size=4096","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-22","phase":"R01 调参","provenance":"fixture","event":22},{"from":"router","to":"dispatcher","message":"准入通过，直接登记 Explore task-0003","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-23","phase":"R01 调参","provenance":"project_logic","event":23,"corroboration":"../src/hyperloop/router.py#L83"},{"from":"dispatcher","to":"explore","message":"下发 R01 调参任务和锁定负载","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-27","phase":"R01 调参","provenance":"project_logic","event":27},{"from":"explore","to":"evaluator","message":"分别校验并测 R01 和配对父版 base，形成服务比较","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/evaluation/task-0003-p0/validation_flow.json","phase":"R01 调参","provenance":"simulation"},{"from":"verdict","to":"coordinator","message":"R01 正确性和性能门通过，KEEP；接受版吞吐 110 tok/s","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-32","phase":"R01 调参","provenance":"project_logic","event":32},{"from":"orchestration","to":"router","message":"回放 Specialist 委派，调查 Attention 调用路径","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-44","phase":"R02 补丁与审批","provenance":"fixture","event":44},{"from":"router","to":"dispatcher","message":"登记专项任务 task-0005，模式 author","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-45","phase":"R02 补丁与审批","provenance":"project_logic","event":45},{"from":"dispatcher","to":"specialist","message":"启动专项任务，交付当前版和 Attention 调用路径调查","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-49","phase":"R02 补丁与审批","provenance":"project_logic","event":49},{"from":"specialist","to":"router","message":"经 Coordinator 提交回放提案 R02，补丁路径占位 sglang/attention.py","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-54","phase":"R02 补丁与审批","provenance":"fixture","event":54},{"from":"router","to":"critic","message":"登记 review-R02 为 pending，关联提交人、父版 R01 和候选范围","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-55","phase":"R02 补丁与审批","provenance":"project_logic","event":55},{"from":"critic","to":"router","message":"回放批准 review-R02，携带评审理由","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-60","phase":"R02 补丁与审批","provenance":"fixture","event":60},{"from":"router","to":"dispatcher","message":"审批放行后登记补丁集成 task-0006","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-62","phase":"R02 补丁与审批","provenance":"project_logic","event":62},{"from":"dispatcher","to":"integrate","message":"执行 R02 占位补丁的候选集成；隔离加载由模拟后端返回","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-66","phase":"R02 补丁与审批","provenance":"project_logic","event":66},{"from":"integrate","to":"evaluator","message":"送整套 R01+R02 模拟候选校验并与配对父版比较","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/evaluation/task-0006/validation_flow.json","phase":"R02 补丁与审批","provenance":"simulation"},{"from":"verdict","to":"coordinator","message":"R02 通过判据，KEEP；接受版吞吐 115 tok/s","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-71","phase":"R02 补丁与审批","provenance":"project_logic","event":71},{"from":"coordinator","to":"router","message":"进入算子阶段，登记 kernel_agent · backend=forge","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-83","phase":"Forge 算子与整栈复测","provenance":"project_logic","event":83},{"from":"dispatcher","to":"kernel","message":"启动 task-0007，按 Forge 契约读取有效 Profile 和已接受的 R01、R02","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-85","phase":"Forge 算子与整栈复测","provenance":"project_logic","event":85},{"from":"kernel","to":"forge","message":"按 Forge 模拟契约交目标 R02、Profile、负载、两个候选 K-FORGE 与 R03","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/evidence/kernel/task-0007-handoff.json","phase":"Forge 算子与整栈复测","provenance":"simulation"},{"from":"forge","to":"evaluator","message":"模拟发布 Attention 补丁交付记录、调用位置和算子设备计时中位数 81 μs","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/evidence/kernel/task-0007-k0-forge-publication.json","phase":"Forge 算子与整栈复测","provenance":"simulation","corroboration":"../.runs/full-flow-visual/replay/simulated/forge-tp2/evaluation/task-0007-k0-tool/device_timing.json"},{"from":"evaluator","to":"verifier","message":"核对模拟加载组合 R01 + R02 + K-FORGE，先比算子输出、再比服务输出","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/evaluation/task-0007-k0/candidate_launch.json","phase":"Forge 算子与整栈复测","provenance":"simulation","corroboration":"../.runs/full-flow-visual/replay/simulated/forge-tp2/evaluation/task-0007-k0/validation_flow.json"},{"from":"benchmark","to":"evaluator","message":"独立重测候选整栈和父版，候选端到端模拟吞吐 122 tok/s","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/evaluation/task-0007-k0/candidate_measurement.json","phase":"Forge 算子与整栈复测","provenance":"simulation"},{"from":"verdict","to":"coordinator","message":"K-FORGE KEEP；R03 仅比父版增益 0.82%，REVERT","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-93","phase":"Forge 算子与整栈复测","provenance":"project_logic","event":93,"corroboration":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-90"},{"from":"coordinator","to":"sweep","message":"经 Router 入队并由 Dispatcher 启动 SWEEP，分别在并发 1/4/8 比较原版和接受整栈","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-106","phase":"并发扫描与收尾","provenance":"project_logic","event":106},{"from":"sweep","to":"coordinator","message":"返还三档模拟配对扫描，记录完成后允许回到框架阶段","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-112","phase":"并发扫描与收尾","provenance":"simulation","event":112,"corroboration":"../.runs/full-flow-visual/replay/simulated/forge-tp2/evidence/sweep/task-0009.json"},{"to":"close","message":"达到轮数上限，进入收尾检查，保留已验收版本","phase":"关闭与归档","provenance":"project_logic","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-130","event":130,"from":"coordinator"},{"to":"recipe","message":"保存当前有效配置、适用条件与证据引用","phase":"关闭与归档","provenance":"project_logic","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-132","event":132,"from":"close"},{"from":"close","to":"report","message":"第二轮无新接受改动，后续扫描跳过；轮数上限收尾，输出整栈报告、失败原因与 Recipe","evidence":"../.runs/full-flow-visual/replay/simulated/forge-tp2/report.html#event-135","phase":"并发扫描与收尾","provenance":"project_logic","event":135}]},{"id":"exceptions","label":"异常分支 · 补救、恢复与收尾","mode":"simulated","report":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#validation","steps":[{"to":"coordinator","message":"固定模拟版本 base-unavailable 和启动失败条件","phase":"失败输入","provenance":"fixture","evidence":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#event-3","event":3,"from":"input"},{"to":"coordinator","message":"原始服务启动失败，返回 backend_failure","phase":"启动补救","provenance":"simulation","evidence":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#event-9","event":9,"from":"baseline"},{"to":"enablement","message":"原始基线不可用，按阶段规则进入 ENABLEMENT","phase":"启动补救","provenance":"project_logic","evidence":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#event-11","event":11,"from":"coordinator"},{"to":"specialist","message":"启动 task-0002，调查 baseline 启动问题","phase":"启动补救","provenance":"project_logic","evidence":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#event-15","event":15,"from":"dispatcher"},{"to":"coordinator","message":"交回预写的最小启动修复，候选版本 base-fixed","phase":"启动补救","provenance":"fixture","evidence":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#event-19","event":19,"from":"specialist"},{"to":"dispatcher","message":"按系统规则登记 task-0003：enablement","phase":"启动补救","provenance":"project_logic","evidence":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#event-21","event":21,"from":"router"},{"to":"evaluator","message":"执行修复版 base-fixed，使用原工作点重新测量","phase":"启动补救","provenance":"project_logic","evidence":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#event-23","event":23,"from":"enablement"},{"to":"evidence","message":"修复版形成可运行基线，模拟吞吐 100 tok/s","phase":"启动补救","provenance":"simulation","evidence":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#event-27","event":27,"from":"evaluator","corroboration":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/coverage-result.json"},{"to":"recovery","message":"找到已保存的 task-0005 回执，复用测量与候选记录","phase":"中断恢复","provenance":"project_logic","evidence":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#event-47","event":47,"from":"evidence","corroboration":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/coverage-result.json"},{"to":"dispatcher","message":"继续结算同一 Explore 任务，原回执与尝试文件保持原样","phase":"中断恢复","provenance":"project_logic","evidence":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#event-48","event":48,"from":"recovery"},{"to":"router","message":"最终整栈证据失效，登记 stack_revalidate","phase":"收尾补测","provenance":"project_logic","evidence":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#event-151","event":151,"from":"close"},{"to":"evaluator","message":"启动 task-0013，复测已接受的整套 K-FORGE","phase":"收尾补测","provenance":"project_logic","evidence":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#event-153","event":153,"from":"dispatcher"},{"to":"close","message":"补测通过，取回相对基线 +22% 的模拟整栈结果","phase":"收尾补测","provenance":"simulation","evidence":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#event-157","event":157,"from":"evaluator","corroboration":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/coverage-result.json"},{"to":"recipe","message":"登记 K-FORGE 优化参数与证据引用","phase":"关闭与归档","provenance":"project_logic","evidence":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#event-159","event":159,"from":"close"},{"to":"report","message":"收尾完成，保存原始失败、补救、恢复与最终整栈证据","phase":"关闭与归档","provenance":"project_logic","evidence":"../.runs/full-flow-visual/coverage/simulated/exception-paths-194015080096/report.html#event-162","event":162,"from":"close"}]}]}</script>
+<script>
+"use strict";
+const data=JSON.parse(document.getElementById("trace-data").textContent);
+const surfaceWidth=1320, nodeWidth=138, nodeHeight=55;
+const bands=[
+  {title:"任务、角色与派发",y:51,items:[
+    ["input","任务输入","目标、环境与规则"],["coordinator","Coordinator","锁定条件、推进阶段"],["orchestration","Orchestration","提出优化尝试"],["specialist","Specialist","调查或交补丁提案"],["critic","Critic 预审","审批待审提案"],["router","Intent Router","区分待审和入队"],["policy","PolicyGate","检查动作权限"],["dispatcher","Dispatcher","资源允许才启动"]]},
+  {title:"各阶段执行",y:183,items:[
+    ["reference","原版 Reference","独立采集与保存"],["baseline","基线任务","建立原版成绩"],["explore","Explore","调参试验"],["integrate","Integrate Patch","集成框架候选"],["profiler","Profiler","逐 rank 采集"],["trace_analyzer","Trace Analyzer","定位热点"],["kernel","Kernel Agent","从热点选候选"],["sweep","SWEEP","原版与整栈成对测"]]},
+  {title:"评测、工具与服务",y:315,items:[
+    ["geak","GEAK","交服务配置及成绩"],["forge","Forge","交补丁信息与计时"],["evaluator","Evaluator","组织校验与复测"],["runtime","RuntimeBackend","提供目标执行接口"],["sglang","真实 SGLang","NPU 服务 /generate"],["enablement","Enablement","执行启动补救"]]},
+  {title:"留证、裁决与交付",y:447,items:[
+    ["verifier","Verifier","核身份、比输出"],["benchmark","BenchmarkRunner","记录请求和计时"],["evidence","Session 证据","保存原始观测与事件"],["verdict","独立实测裁决","核证据、按门槛判"],["recovery","恢复任务","读回执并继续"],["close","CLOSE","核验整栈和收尾"],["recipe","Recipe","记录有效配置"],["report","Report","交回结果与归档"]]}
+];
+const byId=id=>document.getElementById(id);
+const labels={real_execution:"真机观测",project_logic:"项目程序交接",fixture:"预设输入或角色回复",simulation:"模拟执行或产物"};
+const scopeText={
+  real:"已验真实 SGLang。R01 输出一致，配对父版 96.77 tok/s，候选 83.40 tok/s。首 token 延迟 202.45 → 374.39 ms，裁决 REVERT。",
+  geak:"GEAK 式完整模拟。角色回复及工具结果为预设输入，项目实际执行派发、校验规则、写回和扫描。",
+  forge:"Forge 式完整模拟。角色回复及工具结果为预设输入，项目实际执行派发、校验规则、写回和扫描。",
+  exceptions:"单独的模拟会话。选段展示原版启动失败后的补救、从回执恢复，以及收尾时重新验证整套版本。"
+};
+const alias={trace:"trace_analyzer",artifacts:"evidence",session:"evidence",decision:"verdict",decision_gate:"verdict",runner:"benchmark",backend:"runtime",task:"input"};
+const actors=new Map(), nodeElements=new Map(), edgeRoutes=new Map();
+function svg(tag,attrs={},value){
+  const element=document.createElementNS("http://www.w3.org/2000/svg",tag);
+  for(const [key,attribute] of Object.entries(attrs)) element.setAttribute(key,attribute);
+  if(value!==undefined) element.textContent=value;
+  return element;
+}
+for(const band of bands){
+  byId("lanes").append(svg("rect",{class:"lane",x:8,y:band.y-28,width:1304,height:102,rx:9}));
+  byId("lanes").append(svg("text",{class:"lane-title",x:22,y:band.y-10},band.title));
+  const count=band.items.length;
+  band.items.forEach(([id,label,sub],index)=>{
+    const cx=93+1134*index/(count-1);
+    const box={id,label,sub,cx,x:cx-nodeWidth/2,y:band.y};
+    actors.set(id,box);
+    const group=svg("g",{class:"node","data-actor":id});
+    group.append(svg("rect",{x:box.x,y:box.y,width:nodeWidth,height:nodeHeight,rx:9}));
+    group.append(svg("text",{x:cx,y:box.y+23,"text-anchor":"middle"},label));
+    group.append(svg("text",{class:"sub",x:cx,y:box.y+41,"text-anchor":"middle"},sub));
+    byId("nodes").append(group);
+    nodeElements.set(id,group);
+  });
+}
+const sceneList=data.scenarios.map(scene=>({...scene,steps:scene.steps.map(step=>({
+  ...step,from:alias[step.from]||step.from,to:alias[step.to]||step.to
+}))}));
+function key(from,to){return from+"--"+to;}
+function simplify(points){
+  const cleaned=points.filter(([x,y],i)=>i===0||x!==points[i-1][0]||y!==points[i-1][1]);
+  return cleaned.filter(([x,y],i)=>i===0||i===cleaned.length-1||
+    !((x===cleaned[i-1][0]&&x===cleaned[i+1][0])||(y===cleaned[i-1][1]&&y===cleaned[i+1][1])));
+}
+function hits(points,from,to){
+  for(let i=1;i<points.length;i++){
+    const [x1,y1]=points[i-1], [x2,y2]=points[i];
+    for(const box of actors.values()){
+      if(box.id===from||box.id===to) continue;
+      if(Math.max(x1,x2)>box.x-4&&Math.min(x1,x2)<box.x+nodeWidth+4&&
+         Math.max(y1,y2)>box.y-4&&Math.min(y1,y2)<box.y+nodeHeight+4) return true;
+    }
+  }
+  return false;
+}
+function distance(points){return points.slice(1).reduce((sum,[x,y],i)=>sum+Math.abs(x-points[i][0])+Math.abs(y-points[i][1]),0);}
+function route(from,to){
+  const id=key(from,to);
+  if(edgeRoutes.has(id)) return edgeRoutes.get(id);
+  const a=actors.get(from), b=actors.get(to);
+  const dir=from<to?1:-1, choices=[];
+  if(from===to){
+    const x=a.cx, y=a.y;
+    choices.push([[x-15,y],[x-15,y-18],[x+15,y-18],[x+15,y]]);
+  }else{
+    const columns=[18,1300,a.cx-dir*8,b.cx+dir*8, ...[...actors.values()].flatMap(box=>[box.x-8,box.x+nodeWidth+8])];
+    for(const exit of [-1,1]) for(const enter of [-1,1]){
+      if(a.y===b.y&&(exit!==1||enter!==1))continue;
+      const ax=a.cx-dir*8, ay=a.y+(exit>0?nodeHeight:0), ay2=ay+exit*(15+dir*3);
+      const bx=b.cx+dir*8, by=b.y+(enter>0?nodeHeight:0), by2=by+enter*(15-dir*3);
+      for(const channel of columns){
+        choices.push(simplify([[ax,ay],[ax,ay2],[channel,ay2],[channel,by2],[bx,by2],[bx,by]]));
+      }
+    }
+  }
+  const safe=choices.filter(points=>!hits(points,from,to));
+  const points=(safe.length?safe:choices).sort((x,y)=>distance(x)+x.length*12-distance(y)-y.length*12)[0];
+  const d=points.map(([x,y],i)=>(i?"L":"M")+x+" "+y).join("");
+  const segments=points.slice(1).map(([x,y],i)=>({
+    x:(x+points[i][0])/2,y:(y+points[i][1])/2,
+    length:Math.abs(x-points[i][0])+Math.abs(y-points[i][1]),horizontal:y===points[i][1]
+  })).sort((x,y)=>y.length-x.length);
+  const info={d,anchor:segments.find(s=>s.horizontal&&s.length>55)||segments[0]};
+  edgeRoutes.set(id,info);
+  return info;
+}
+let current=0, index=0, playing=false, frame=0, start=null, elapsed=0;
+const duration=1950;
+const reduced=window.matchMedia("(prefers-reduced-motion: reduce)");
+function href(value){
+  return typeof value==="string"&&/^(?:\.\.\/(?:\.runs|src|configs|fixtures)\/|\.\/|#)/.test(value)&&!value.includes("\\")?value:"";
+}
+function link(container,text,url){
+  const checked=href(url);
+  if(!checked) return;
+  const anchor=document.createElement("a");
+  anchor.textContent=text; anchor.href=checked; container.append(anchor);
+}
+function countUnits(text){
+  return [...text].reduce((units,char)=>units+(char.charCodeAt(0)<128?0.58:1),0);
+}
+function wrap(text,maxUnits){
+  const lines=[]; let line="", units=0;
+  for(const char of text){
+    const width=char.charCodeAt(0)<128?0.58:1;
+    if(units+width>maxUnits&&line){lines.push(line);line="";units=0;}
+    line+=char;units+=width;
+  }
+  if(line) lines.push(line);
+  return lines;
+}
+function graphLabel(message,anchor){
+  const group=byId("edge-label"), text=group.querySelector("text"), box=group.querySelector("rect"), leader=group.querySelector("line");
+  const lines=wrap(message,32);
+  const width=Math.max(...lines.map(countUnits))*13+22, height=lines.length*17+13;
+  const clamp=(value,min,max)=>Math.max(min,Math.min(max,value));
+  const variations=[[anchor.x-width/2,anchor.y+7],[anchor.x-width/2,anchor.y-height-7],
+    [anchor.x+8,anchor.y-height/2],[anchor.x-width-8,anchor.y-height/2]].map(([left,top])=>
+      [clamp(left,9,surfaceWidth-width-9),clamp(top,8,555-height)]);
+  const [left,top]=variations.find(([x,y])=>![...actors.values()].some(other=>
+    x+width>other.x-2&&x<other.x+nodeWidth+2&&y+height>other.y-2&&y<other.y+nodeHeight+2))||variations[0];
+  box.setAttribute("x",left);box.setAttribute("y",top);box.setAttribute("width",width);box.setAttribute("height",height);
+  leader.setAttribute("x1",anchor.x);leader.setAttribute("y1",anchor.y);
+  leader.setAttribute("x2",clamp(anchor.x,left,left+width));leader.setAttribute("y2",clamp(anchor.y,top,top+height));
+  text.replaceChildren(...lines.map((line,i)=>svg("tspan",{x:left+width/2,y:top+17+17*i},line)));
+}
+const pulse=byId("pulse"), signal=byId("signal-edge");
+function paint(progress){
+  if(reduced.matches){pulse.setAttribute("hidden","");return;}
+  pulse.removeAttribute("hidden");
+  const point=signal.getPointAtLength(signal.getTotalLength()*Math.max(0,Math.min(1,progress)));
+  pulse.setAttribute("cx",point.x);pulse.setAttribute("cy",point.y);
+}
+function refresh(){
+  const scene=sceneList[current], step=scene.steps[index];
+  const from=actors.get(step.from), to=actors.get(step.to), path=route(step.from,step.to);
+  for(const [id,element] of nodeElements){
+    element.dataset.phase=id===step.from?"sender":id===step.to?"receiver":"";
+  }
+  byId("actors").textContent=from.label+" → "+to.label;
+  byId("message").textContent=step.message;
+  byId("step-phase").textContent=[step.phase,step.event?"事件 #"+step.event:null].filter(Boolean).join(" · ");
+  const kind=byId("kind");kind.dataset.kind=step.provenance;kind.textContent=labels[step.provenance]||"证据交接";
+  const evidence=byId("evidence"), url=href(step.evidence);
+  evidence.hidden=!url;if(url)evidence.href=url;else evidence.removeAttribute("href");
+  const extra=byId("corroboration"), corroboration=href(step.corroboration);
+  extra.hidden=!corroboration;if(corroboration)extra.href=corroboration;else extra.removeAttribute("href");
+  byId("counter").textContent=(index+1)+" / "+scene.steps.length;
+  byId("seek").value=index+1;
+  byId("seek").setAttribute("aria-valuetext","第 "+(index+1)+" 步");
+  byId("prev").disabled=index===0;byId("next").disabled=index===scene.steps.length-1;
+  for(const [i,button] of [...byId("steps").querySelectorAll("button")].entries())button.setAttribute("aria-current",String(index===i));
+  signal.setAttribute("d",path.d);
+  graphLabel(step.message,path.anchor);
+  paint(elapsed/(duration*.78));
+}
+function pause(){
+  playing=false;cancelAnimationFrame(frame);start=null;byId("play").textContent="播放";
+}
+function position(i){
+  pause();index=Math.min(Math.max(0,i),sceneList[current].steps.length-1);elapsed=0;refresh();
+}
+function tick(now){
+  if(!playing)return;
+  if(start===null)start=now-elapsed;
+  elapsed=now-start;
+  paint(elapsed/(duration*.78));
+  if(elapsed>=duration){
+    if(index+1>=sceneList[current].steps.length){pause();elapsed=duration;paint(1);return;}
+    index++;elapsed=0;start=now;refresh();
+  }
+  frame=requestAnimationFrame(tick);
+}
+byId("play").addEventListener("click",()=>{
+  if(playing){pause();return;}
+  if(index===sceneList[current].steps.length-1&&elapsed>0){index=0;elapsed=0;refresh();}
+  playing=true;byId("play").textContent="暂停";frame=requestAnimationFrame(tick);
+});
+byId("prev").addEventListener("click",()=>position(index-1));
+byId("next").addEventListener("click",()=>position(index+1));
+byId("seek").addEventListener("input",event=>position(Number(event.target.value)-1));
+document.addEventListener("visibilitychange",()=>{if(document.hidden)pause();});
+reduced.addEventListener("change",()=>{if(reduced.matches){pause();paint(0);}else paint(elapsed/(duration*.78));});
+function selectScene(i){
+  pause();current=i;index=0;elapsed=0;
+  const scene=sceneList[current], used=new Set(), unique=new Map();
+  for(const step of scene.steps){
+    used.add(step.from);used.add(step.to);
+    const id=key(step.from,step.to);
+    if(!unique.has(id))unique.set(id,{...step});
+  }
+  for(const [id,element] of nodeElements)element.dataset.used=String(used.has(id));
+  byId("edges").replaceChildren(...[...unique.values()].map(step=>{
+    const path=svg("path",{class:"edge",d:route(step.from,step.to).d,"marker-end":"url(#head)"});
+    path.append(svg("title",{},actors.get(step.from).label+" → "+actors.get(step.to).label+" · "+step.message));
+    return path;
+  }));
+  byId("scenario-summary").textContent=scene.summary||scopeText[scene.id]||scene.label;
+  byId("scenario-links").replaceChildren();
+  link(byId("scenario-links"),"会话原始报告",scene.report);
+  byId("seek").max=scene.steps.length;
+  [...byId("scenes").querySelectorAll("button")].forEach((button,j)=>button.setAttribute("aria-pressed",String(j===i)));
+  byId("steps").replaceChildren(...scene.steps.map((step,j)=>{
+    const row=document.createElement("li"), button=document.createElement("button");
+    button.type="button";button.textContent=actors.get(step.from).label+" → "+actors.get(step.to).label+" · "+step.message;
+    button.addEventListener("click",()=>position(j));row.append(button);return row;
+  }));
+  refresh();
+}
+function coverageLabel(id,scene){
+  const linked=scene.steps.filter(step=>step.from===id||step.to===id);
+  if(!linked.length)return "本回放无交接";
+  if(id==="orchestration"||id==="specialist"||id==="critic")return "预写回复";
+  if(scene.id==="real"){
+    if(["reference","baseline","runtime","sglang","verifier","benchmark","evaluator"].includes(id))return "实机路径";
+    return "程序走过";
+  }
+  if(["geak","forge","runtime","profiler","trace_analyzer","kernel","benchmark"].includes(id))return "模拟证据";
+  if(id==="integrate")return "模拟补丁登记";
+  return "程序走过";
+}
+for(const [id,actor] of actors){
+  const row=document.createElement("tr"), head=document.createElement("th");
+  head.scope="row";head.textContent=actor.label;row.append(head);
+  for(const scene of sceneList){const cell=document.createElement("td");cell.textContent=coverageLabel(id,scene);row.append(cell);}
+  byId("coverage-rows").append(row);
+}
+byId("coverage-note").textContent=data.coverageNote||"完整真机验收还需要实际 Agent 回复、真机 Profile、可应用的框架补丁、算子交付及整栈复测、真实并发扫描和双卡验证。";
+sceneList.forEach((scene,i)=>{
+  const button=document.createElement("button");
+  button.type="button";button.textContent=scene.label;button.setAttribute("aria-pressed","false");
+  button.addEventListener("click",()=>selectScene(i));byId("scenes").append(button);
+});
+selectScene(0);
+</script>
 </body>
 </html>
