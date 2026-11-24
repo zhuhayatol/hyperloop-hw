@@ -174,7 +174,7 @@ def rank_hotspots(rank_record: Mapping[str, Any]) -> list[dict[str, Any]]:
     events = rank_record.get("events")
     if not isinstance(events, list):
         raise EvidenceProblem("profile_events_invalid")
-    grouped: dict[tuple[str, str, tuple[int, ...], str], list[float]] = defaultdict(list)
+    grouped: dict[tuple[str, str, tuple[int, ...], str, str, str, str], list[float]] = defaultdict(list)
     for event in events:
         if not isinstance(event, dict):
             raise EvidenceProblem("profile_event_invalid")
@@ -183,16 +183,21 @@ def rank_hotspots(rank_record: Mapping[str, Any]) -> list[dict[str, Any]]:
         duration = event.get("duration_us")
         shape = event.get("input_shape", [])
         dtype = event.get("dtype", "")
+        phase = event.get("phase", "")
+        operator = event.get("operator", "")
+        kind = event.get("event_kind", "")
         if (
             not isinstance(name, str) or not isinstance(callsite, str) or not numeric(duration) or duration < 0
             or not isinstance(shape, list) or any(type(dim) is not int or dim < 1 for dim in shape)
-            or not isinstance(dtype, str)
+            or not all(isinstance(field, str) for field in (dtype, phase, operator, kind))
         ):
             raise EvidenceProblem("profile_event_invalid")
-        grouped[name, callsite, tuple(shape), dtype].append(duration)
+        grouped[name, callsite, tuple(shape), dtype, phase, operator, kind].append(duration)
     return sorted(
         [{"rank": rank_record["rank"], "name": name, "callsite": callsite, "events": len(durations),
-          "duration_us": sum(durations), "input_shape": list(shape), "dtype": dtype}
-         for (name, callsite, shape, dtype), durations in grouped.items()],
+          "duration_us": sum(durations), "input_shape": list(shape), "dtype": dtype,
+          **({"phase": phase} if phase else {}), **({"operator": operator} if operator else {}),
+          **({"event_kind": kind} if kind else {})}
+         for (name, callsite, shape, dtype, phase, operator, kind), durations in grouped.items()],
         key=lambda item: (-item["duration_us"], item["name"], item["callsite"]),
     )

@@ -8,17 +8,37 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Protocol
 
+from ..contracts import ContractError
+
 AGENT_ROLES = frozenset({"orchestration", "critic", "specialist"})
 
 
+class AgentInvocationError(ContractError):
+    """A provider turn failed with a receipt safe to record locally."""
+
+    def __init__(self, receipt: dict[str, Any]) -> None:
+        self.receipt = receipt
+        super().__init__(f"DeepSeek {receipt['role']} turn failed: {receipt['reason']}")
+
+
 class AgentBackend(Protocol):
+    last_receipt: dict[str, Any] | None
+
     def run(self, role: str, context: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Emit intents for one role turn."""
         ...
 
+    def has_next(self, role: str) -> bool: ...
+
+    def snapshot(self) -> dict[str, Any]: ...
+
+    def restore(self, snapshot: Mapping[str, Any]) -> None: ...
+
 
 class ReplayAgentBackend:
     """Replay role turns deterministically without using a model service."""
+
+    last_receipt = None
 
     def __init__(self, responses: Mapping[str, Sequence[Sequence[Mapping[str, Any]]]]) -> None:
         if not isinstance(responses, Mapping):

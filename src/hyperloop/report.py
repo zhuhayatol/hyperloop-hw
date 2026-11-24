@@ -513,6 +513,72 @@ def _validation_section(summary: dict[str, Any]) -> str:
     return "".join(tasks) or "<p>尚无验证任务。</p>"
 
 
+def _agent_candidates(params: Any) -> list[Mapping[str, Any]]:
+    fields = _mapping(params)
+    return [*_records(fields.get("candidates")), *_records([fields.get("candidate")])]
+
+
+def _agent_call_rows(raw_events: list[Mapping[str, Any]], state: Mapping[str, Any], read_evidence) -> list[dict]:
+    proposals: dict[str, Mapping[str, Any]] = {}
+    routed_tasks: dict[str, list[str]] = {}
+    for event in raw_events:
+        data = _mapping(event.get("payload"))
+        if event.get("type") == "proposal_registered" and isinstance(data.get("proposal_id"), str):
+            proposals[data["proposal_id"]] = data
+        if event.get("type") == "intent_result":
+            task_id = _mapping(data.get("result")).get("task_id")
+            if isinstance(data.get("turn_id"), str) and isinstance(task_id, str):
+                routed_tasks.setdefault(data["turn_id"], []).append(task_id)
+
+    result = []
+    for event in raw_events:
+        if event.get("type") != "agent_provider_call":
+            continue
+        data = _mapping(event.get("payload"))
+        proof = read_evidence(_mapping(data.get("evidence"))) or {}
+        intents = _records(proof.get("normalized_intents"))
+        candidates = set()
+        for intent in intents:
+            proposal_id = intent.get("proposal_id")
+            origin = proposals.get(proposal_id, {}) if isinstance(proposal_id, str) else {}
+            specs = _agent_candidates(intent.get("params")) + _agent_candidates(origin.get("params"))
+            candidates.update(spec["id"] for spec in specs if isinstance(spec.get("id"), str))
+        tasks = routed_tasks.get(data.get("turn_id"), [])
+        decisions = [
+            {**{key: row[key] for key in ("candidate_id", "version_action", "reason") if key in row},
+             "anchor": f"candidate-outcome-{index}"}
+            for index, row in enumerate(_records(state.get("decisions")), 1)
+            if row.get("candidate_id") in candidates or row.get("task_id") in tasks
+        ]
+        preview = _pretty(intents) if "normalized_intents" in proof else None
+        if preview and len(preview) > 1200:
+            preview = preview[:1200] + "\n…"
+        result.append({**data, "event_seq": event["seq"], "preview": preview, "outcomes": decisions})
+    return result
+
+
+def _agent_call_title(row: Mapping[str, Any]) -> str:
+    return " · ".join(_label(row.get(key)) for key in ("turn_id", "role", "model", "status"))
+
+
+def _agent_call_section(summary: dict[str, Any]) -> str:
+    result = []
+    for row in summary["agent_calls"]:
+        outcomes = "".join(
+            f'<li><a href="#{_h(outcome["anchor"])}">{_h(outcome.get("candidate_id"))}</a>'
+            f' · {_h(outcome.get("version_action"))} · {_h(outcome.get("reason"))}</li>'
+            for outcome in row["outcomes"]
+        )
+        metadata = {key: row[key] for key in ("provider", "response_id", "usage", "intent_count", "reason") if key in row}
+        preview = f'<pre>{escape(row["preview"])}</pre>' if row["preview"] is not None else ""
+        result.append(_details(
+            _agent_call_title(row), metadata, _evidence_for(row, summary["evidence"]),
+            body=f'<p><a href="#event-{row["event_seq"]}">调用事件</a></p>'
+                 + (f"<ul>{outcomes}</ul>" if outcomes else "") + preview,
+        ))
+    return "".join(result) or "<p>尚无外部 Agent 调用记录。</p>"
+
+
 def _report_html(summary: dict[str, Any]) -> str:
     heading = _heading_data(summary)
     mode = _h(summary["mode"])
@@ -520,6 +586,7 @@ def _report_html(summary: dict[str, Any]) -> str:
     sections = {
         "overview": "运行范围",
         "validation": "验证交接图",
+        "agents": "Agent 回复",
         "decisions": "候选验收",
         "profiles": "采集与扫描",
         "timeline": "执行时间线",
@@ -528,7 +595,10 @@ def _report_html(summary: dict[str, Any]) -> str:
     navigation = "".join(f'<a href="#{key}">{title}</a>' for key, title in sections.items())
     rows = [_decision_fields(row) for row in summary["decisions"]]
     evidence = summary["evidence"]
-    decisions = "".join(_html_decision(row, summary) for row in summary["decisions"])
+    decisions = "".join(
+        f'<div id="candidate-outcome-{index}">{_html_decision(row, summary)}</div>'
+        for index, row in enumerate(summary["decisions"], 1)
+    )
     profiles = "".join(
         _details(_profile_title(row), row, _evidence_for(row, evidence)) for row in summary["profiles"]
     )
@@ -560,6 +630,7 @@ def _report_html(summary: dict[str, Any]) -> str:
 <section id="validation"><h2>验证交接图</h2>
 <p>箭头上是发送的内容，接收侧写明执行操作。每条边标出会话事件、执行记录或证据还原。</p>
 {_validation_section(summary)}</section>
+<section id="agents"><h2>Agent 回复</h2>{_agent_call_section(summary)}</section>
 <section id="decisions"><h2>候选验收</h2>
 {_html_table(_DECISION_COLUMNS, rows) if rows else '<p>尚无候选裁决</p>'}
 {decisions}</section>
@@ -604,6 +675,18 @@ def _report_markdown(summary: dict[str, Any]) -> str:
     lines.extend(_md_details("任务及评测规则", summary["scope"]))
     lines.extend(_md_details("贡献来源", summary["contributions"]))
     lines.extend(["## 验证交接图", "", "[在 HTML 中逐次查看发送方、接收方和证据](report.html#validation)", ""])
+    lines.extend(["## Agent 回复", ""])
+    for row in summary["agent_calls"]:
+        lines.append(f"- {_md(_agent_call_title(row))} · 回复 ID {_md(row.get('response_id'))}")
+        for evidence in _evidence_for(row, summary["evidence"]):
+            if evidence["href"] is not None:
+                lines.append(f"  - [角色输入与结构化回复]({evidence['href']})")
+        for outcome in row["outcomes"]:
+            lines.append(f"  - [{_md(outcome.get('candidate_id'))}](report.html#{outcome['anchor']})"
+                         f" · {_md(outcome.get('version_action'))} · {_md(outcome.get('reason'))}")
+    if not summary["agent_calls"]:
+        lines.append("尚无外部 Agent 调用记录。")
+    lines.append("")
     lines.extend(["## 候选验收", ""])
     decisions = summary["decisions"]
     if decisions:
@@ -677,6 +760,7 @@ def write_report(
         "stack_validations": _records(state.get("stack_validations")),
         "timeline": timeline,
         "evidence": evidence,
+        "agent_calls": _agent_call_rows(raw_events, state, read_graph_evidence),
         "validation_graphs": build_validation_graphs(state, raw_events, read_graph_evidence)
         + build_reproduction_graphs(reproductions, read_graph_evidence),
         "stop_reason": state.get("stop_reason"),

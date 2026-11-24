@@ -41,7 +41,10 @@ def candidate_revision(
     elif kind == "patch":
         if not isinstance(candidate.get("patch_path"), str) or not candidate["patch_path"]:
             raise ContractError("framework patch must name its changed path")
-        revision["framework"].append({**entry, "patch_path": candidate["patch_path"]})
+        entry["patch_path"] = candidate["patch_path"]
+        if "source_edit" in candidate:
+            entry["source_edit"] = deepcopy(candidate["source_edit"])
+        revision["framework"].append(entry)
     elif kind == "kernel":
         if not candidate.get("operator") or not candidate.get("profile_ref"):
             raise ContractError("kernel candidate must name a hotspot and its evidence")

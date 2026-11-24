@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from .actions.knowledge import RECIPE_PATH, build_recipe, validate_recipe
 from .actions.runtime import RuntimeActions, accepted_revision
-from .agents import ReplayAgentBackend
+from .agents import AgentInvocationError, build_agent_backend
 from .artifacts import publish_indexes
 from .backends import RuntimeBackend
 from .backends.factory import RuntimeBackendFactory, build_runtime, checked_probe
@@ -32,7 +32,9 @@ class Coordinator:
         validate_task(task)
         validate_target(target)
         validate_reference(reference, task)
-        ReplayAgentBackend(scenario.get("agents", {}))
+        agents = build_agent_backend(scenario, task, target)
+        if scenario.get("agent_provider", {}).get("provider") == "deepseek":
+            scenario = {**scenario, "agent_provider": agents.snapshot()}
         backend = build_runtime(target, scenario, task["initial_revision"], backend_factory)
         runtime = checked_probe(backend, target, mode=target["mode"])
         capture = scenario.get("reference_capture")
@@ -75,7 +77,7 @@ class Coordinator:
         if bind_session is not None:
             bind_session(store.path)
         self.actions = RuntimeActions(store, self.backend)
-        self.agents = ReplayAgentBackend(self.scenario.get("agents", {}))
+        self.agents = build_agent_backend(self.scenario, self.task, store.manifest["target"])
         self.dispatcher = Dispatcher(emit=self._emit)
         self.router = IntentRouter(
             PolicyGate(store.path / "workspaces", self.task.get("allowed_parameters")),
@@ -202,6 +204,8 @@ class Coordinator:
                     producer="action_executor",
                 )
                 self._finish_task(task, result, receipt)
+                if result.get("agent_failure"):
+                    raise AgentInvocationError(result["agent_failure"])
                 if self.dispatcher.get(task["task_id"])["status"] == "cleanup_pending":
                     break
         else:
@@ -254,8 +258,18 @@ class Coordinator:
                 return {"status": "ok", "fix": fix, "reason": "suggested_fix" if fix else "no_enablement_candidate"}
             context = self._context("specialist")
             context["assignment"] = task["params"]
-            responses = self.agents.run("specialist", context)
-            return {"status": "ok", "role_context": context, "responses": responses, "agents": self.agents.snapshot()}
+            try:
+                responses = self.agents.run("specialist", context)
+            except AgentInvocationError as error:
+                return {"status": "failed", "reason": error.receipt["reason"], "agent_failure": error.receipt}
+            result = {"status": "ok", "role_context": context, "responses": responses, "agents": self.agents.snapshot()}
+            if self.agents.last_receipt is not None:
+                result["agent_call"] = self.agents.last_receipt
+                result["role_context"] = {
+                    "current_revision": {"id": context["current_revision"]["id"]},
+                    "profile": {"report_ref": (context["profile"] or {}).get("report_ref")},
+                }
+            return result
         run = {
             "baseline": self.actions.baseline, "enablement": self.actions.enablement,
             "profile": self.actions.profile,
@@ -285,8 +299,12 @@ class Coordinator:
         if action == "specialist" and task["params"].get("mode") == "enablement":
             self._emit("enablement_suggestion", {**result, **common})
         elif action == "specialist":
-            self.agents.restore(result["agents"])
-            self._route_turn("specialist", result["role_context"], result["responses"], task_id=task["task_id"])
+            if result.get("agent_failure"):
+                self._start_turn("specialist", {}, task["task_id"], result["agent_failure"], [])
+            else:
+                self.agents.restore(result["agents"])
+                self._route_turn("specialist", result["role_context"], result["responses"], task_id=task["task_id"],
+                                 call=result.get("agent_call"))
         elif action in ("baseline", "enablement"):
             if result.get("acceptance") == "pass":
                 current = {
@@ -402,10 +420,29 @@ class Coordinator:
             "recipe": self.state["retrieved_recipe"],
         }
 
-    def _route_turn(self, role: str, context: dict, intents: list[dict], task_id: str | None = None) -> None:
+    def _start_turn(self, role: str, context: dict, task_id: str | None, call: dict | None,
+                    intents: list[dict]) -> str:
         turn_id = f"turn-{self._control['next_turn']:04d}"
         self._control["next_turn"] += 1
-        self._emit("agent_turn_started", {"turn_id": turn_id, "role": role, "task_id": task_id, "context": context})
+        identity = {"turn_id": turn_id, "role": role, "task_id": task_id}
+        self._emit("agent_turn_started", {**identity, "context": context} if call is None else identity)
+        if call is not None:
+            metadata = {**identity, "phase": self.phase, "cycle": self.cycle}
+            evidence = self.store.put_evidence(
+                f"evidence/agents/{safe_id(call['call_id'], 'agent.call_id')}.json",
+                {**call, **metadata, "normalized_intents": intents}, producer="agent_provider",
+            )
+            self._emit("agent_provider_call", {
+                **{key: value for key, value in call.items() if key != "request_context"},
+                **metadata, "evidence": evidence,
+            })
+            if call["status"] == "failed":
+                self._emit("agent_turn_failed", {**identity, "reason": call["reason"]})
+        return turn_id
+
+    def _route_turn(self, role: str, context: dict, intents: list[dict], task_id: str | None = None,
+                    *, call: dict | None = None) -> None:
+        turn_id = self._start_turn(role, context, task_id, call, intents)
         for intent in intents:
             fields = deepcopy(intent)
             payload = fields.get("payload", fields)
@@ -425,8 +462,13 @@ class Coordinator:
 
     def _call_role(self, role: str) -> list[dict]:
         context = self._context(role)
-        replies = self.agents.run(role, context)
-        self._route_turn(role, context, replies)
+        try:
+            replies = self.agents.run(role, context)
+        except AgentInvocationError as error:
+            self._start_turn(role, context, None, error.receipt, [])
+            self._checkpoint()
+            raise
+        self._route_turn(role, context, replies, call=self.agents.last_receipt)
         return replies
 
     def _phase_tasks(self, action: str) -> list[dict]:
@@ -524,8 +566,8 @@ class Coordinator:
             pending and attempts.get(bundle, 0) < self.settings["max_turns_per_cycle"]
             and self.budget >= 1 and self.agents.has_next("critic")
         ):
-            attempts[bundle] = attempts.get(bundle, 0) + 1
             self._call_role("critic")
+            attempts[bundle] = attempts.get(bundle, 0) + 1
             return
         cycle = str(self.cycle)
         count = self._control["turns"].get(cycle, 0)
@@ -534,8 +576,8 @@ class Coordinator:
             not hint and self.budget >= 1 and count < self.settings["max_turns_per_cycle"]
             and self.agents.has_next("orchestration")
         ):
-            self._control["turns"][cycle] = count + 1
             self._call_role("orchestration")
+            self._control["turns"][cycle] = count + 1
             return
         if pending:
             self._emit("critic_bundle_unresolved", {"proposal_ids": pending, "cycle": self.cycle})

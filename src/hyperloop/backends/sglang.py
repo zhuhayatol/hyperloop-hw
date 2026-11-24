@@ -22,6 +22,7 @@ from urllib.request import ProxyHandler, build_opener
 from uuid import uuid4
 
 from .runtime import BackendError, Record, fingerprint
+from .sglang_overlay import loaded_sources, sandbox_launch, source_edit, source_path, stage_overlay
 
 
 _HOST = "127.0.0.1"
@@ -225,6 +226,11 @@ def _chunk_args(args: list[str], chunk: int | None) -> tuple[list[str], int | No
     return result, actual
 
 
+def _provider_credential(name: str) -> bool:
+    key = name.upper()
+    return key.endswith(("_API_KEY", "_API_TOKEN")) or key in {"GH_TOKEN", "GITHUB_TOKEN", "HF_TOKEN"}
+
+
 class SGLangBackend:
     """Use the installed SGLang and model with an owned loopback subprocess."""
 
@@ -241,6 +247,16 @@ class SGLangBackend:
         self._tokenizer = _local_path(config, "tokenizer_path", default=self._model).resolve()
         if not self._python.is_file() or not all(path.is_dir() for path in (self._source, self._model, self._tokenizer)):
             raise BackendError("SGLang runtime requires a Python executable and local source, model and tokenizer directories")
+        allowed_paths = config.get("allowed_source_paths", [])
+        if not isinstance(allowed_paths, list):
+            raise BackendError("target.sglang.allowed_source_paths must be a list of exact SGLang files")
+        self._allowed_source = frozenset(source_path(path) for path in allowed_paths)
+        self._source_sandbox = None
+        if self._allowed_source:
+            sandbox = _local_path(config, "source_sandbox").resolve()
+            if not sandbox.is_file() or not os.access(sandbox, os.X_OK):
+                raise BackendError("target.sglang.source_sandbox must name the executable bubblewrap program")
+            self._source_sandbox = sandbox
         args = config.get("server_args", [])
         if not isinstance(args, list) or any(not isinstance(arg, str) or not arg for arg in args):
             raise BackendError("target.sglang.server_args must be a list of non-empty strings")
@@ -248,16 +264,26 @@ class SGLangBackend:
         if forbidden:
             raise BackendError(f"SGLang runtime owns the following server flags: {', '.join(forbidden)}")
         self._server_args = list(args)
+        self._ascend_use_fia = config.get("ascend_use_fia")
+        if self._ascend_use_fia is not None and type(self._ascend_use_fia) is not bool:
+            raise BackendError("target.sglang.ascend_use_fia must be a boolean")
         self._startup_timeout = _time_limit(config, "startup_timeout", 240)
         self._request_timeout = _time_limit(config, "request_timeout", 120)
+        profile = config.get("profile", {})
+        if (not isinstance(profile, Mapping) or profile.keys() - {"enabled", "export_timeout"}
+                or type(profile.get("enabled", False)) is not bool):
+            raise BackendError("target.sglang.profile must define boolean enabled and optional export_timeout")
+        self._profile_enabled = profile.get("enabled", False)
+        self._profile_export_timeout = _time_limit(profile, "export_timeout", 120)
         self._session: Path | None = None
         self._stacks: dict[str, Record] = {}
         self._hashes: dict[Path, tuple[tuple[int, int, int], str]] = {}
         self._probe: Record | None = None
         self._child: subprocess.Popen[bytes] | None = None
         self._active: Record | None = None
-        self._env = {**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
-                     "TOKENIZERS_PARALLELISM": "false", "PYTHONDONTWRITEBYTECODE": "1"}
+        self._env = {key: value for key, value in os.environ.items() if not _provider_credential(key)}
+        self._env.update({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+                          "TOKENIZERS_PARALLELISM": "false", "PYTHONDONTWRITEBYTECODE": "1"})
 
     def bind_session(self, path: Path) -> None:
         self._session = path.resolve()
@@ -349,11 +375,18 @@ class SGLangBackend:
                 "model_sha256": model_files, "tokenizer_sha256": tokenizer_files,
                 "fixed_server_args": self._server_args,
             }
+            if self._source_sandbox is not None:
+                environment["source_integration"] = {"allowed_paths": sorted(self._allowed_source),
+                                                     "sandbox": str(self._source_sandbox),
+                                                     "sandbox_sha256": self._file_hash(self._source_sandbox)}
+            if self._ascend_use_fia is not None:
+                environment["stock_attention_control"] = {"ASCEND_USE_FIA": self._ascend_use_fia, "ASCEND_USE_FA": False}
         except (OSError, KeyError, IndexError, ValueError, TypeError) as error:
             raise BackendError(f"could not confirm the real SGLang environment: {error}") from error
         self._probe = {
             "mode": "real", "environment": environment, "environment_fingerprint": fingerprint(environment),
-            "capabilities": ["benchmark", "verify"], "npu_smoke": observed["smoke"], "npu_smi": inventory,
+            "capabilities": ["benchmark", "verify", *(["profile"] if self._profile_enabled else [])],
+            "npu_smoke": observed["smoke"], "npu_smi": inventory,
         }
         return deepcopy(self._probe)
 
@@ -361,10 +394,20 @@ class SGLangBackend:
         identifier = revision["id"]
         stack = deepcopy(dict(expected_stack))
         parameters = stack["parameters"]
-        if stack["kernels"] or any(item["kind"] != "parameters" for item in stack["framework"]):
-            raise BackendError("real SGLang runtime only supports base and parameter revisions")
-        if parameters.keys() - {"chunked_prefill_size"}:
-            raise BackendError("real SGLang runtime only supports the chunked_prefill_size parameter")
+        if stack["kernels"]:
+            raise BackendError("this real SGLang runtime has no separately verified device kernel integration")
+        for change in stack["framework"]:
+            if change["kind"] == "patch":
+                source_edit(change, self._allowed_source)
+                if self._source_sandbox is None:
+                    raise BackendError("SGLang source candidates require an isolated runtime")
+            elif change["kind"] != "parameters":
+                raise BackendError(f"unsupported SGLang framework change: {change['kind']}")
+        if parameters.keys() - {"chunked_prefill_size", "ascend_use_fia"}:
+            raise BackendError("unsupported real SGLang framework parameter")
+        if ("ascend_use_fia" in parameters
+                and (self._ascend_use_fia is None or type(parameters["ascend_use_fia"]) is not bool)):
+            raise BackendError("Ascend operator selection requires a locked target default and a boolean candidate")
         if "chunked_prefill_size" in parameters:
             chunk = parameters["chunked_prefill_size"]
             if type(chunk) is not int or (chunk < 1 and chunk != -1):
@@ -385,7 +428,14 @@ class SGLangBackend:
             workspace.mkdir(parents=True, exist_ok=False)
         except OSError as error:
             raise BackendError(f"could not create SGLang workspace: {error}") from error
-        return {"mode": "real", "revision": revision, "kind": kind, "workspace": str(workspace)}
+        prepared = {"mode": "real", "revision": revision, "kind": kind, "workspace": str(workspace)}
+        patches = [item for item in self._stacks[revision]["framework"] if item["kind"] == "patch"]
+        if patches:
+            commit = self._source_revision()
+            if commit != self._target.get("software", {}).get("sglang_commit"):
+                raise BackendError("a source candidate requires the pinned SGLang commit")
+            prepared["source_overlay"] = stage_overlay(self._source, workspace, patches, self._allowed_source, commit=commit)
+        return prepared
 
     def _wait_ready(self, opener_url: str, expected: Mapping[str, Any], log: Path) -> Record:
         deadline = time.monotonic() + self._startup_timeout
@@ -433,12 +483,21 @@ class SGLangBackend:
                    "--model-path", str(self._model), "--tokenizer-path", str(self._tokenizer),
                    "--served-model-name", model_name, "--device", "npu", "--attention-backend", "ascend",
                    "--tp-size", "1", "--dtype", "bfloat16", *args]
+        env, cwd = self._env, workspace
+        source = prepared.get("source_overlay")
+        stock_control = None
+        if self._ascend_use_fia is not None:
+            fia = stack["parameters"].get("ascend_use_fia", self._ascend_use_fia)
+            stock_control = {"ASCEND_USE_FIA": "1" if fia else "0", "ASCEND_USE_FA": "0"}
+            env = {**env, **stock_control}
+        if self._source_sandbox is not None:
+            command, env, cwd = sandbox_launch(command, env, self._source_sandbox, workspace, source)
         lease = {"nonce": nonce, "state": "launching", "pid": None, "port": port,
                  "revision": revision, "launch_command": command}
         try:
             _write_lease(workspace, lease)
             with log.open("xb") as stdout:
-                self._child = subprocess.Popen(command, env={**self._env, _LEASE_ENV: nonce}, cwd=workspace,
+                self._child = subprocess.Popen(command, env={**env, _LEASE_ENV: nonce}, cwd=cwd,
                                                stdout=stdout, stderr=subprocess.STDOUT,
                                                stdin=subprocess.DEVNULL, start_new_session=True)
             lease["pid"] = self._child.pid
@@ -455,6 +514,7 @@ class SGLangBackend:
         if chunk is not None:
             expected["chunked_prefill_size"] = chunk
         loaded = self._wait_ready(base_url, expected, log)
+        observed = loaded_sources(log, source) if source else []
         self._active = {
             "mode": "real", "instance_id": nonce, "revision": revision, "loaded_revision": revision,
             "loaded_stack": deepcopy(stack), "rank_map": probe["environment"]["rank_map"],
@@ -462,6 +522,12 @@ class SGLangBackend:
             "workspace": str(workspace), "ready": True, "candidate_hit": True, "base_url": base_url,
             "pid": self._child.pid, "launch_command": command, "server_log": str(log), "server_info": loaded,
         }
+        if self._source_sandbox is not None:
+            self._active["writable_runtime"] = str(cwd)
+        if source:
+            self._active["source_overlay"] = {**source, "loaded_files": observed}
+        if stock_control is not None:
+            self._active["stock_attention_launch_control"] = stock_control
         return deepcopy(self._active)
 
     def _observation(self, instance: Mapping[str, Any], workload: Mapping[str, Any]) -> Record:
@@ -490,7 +556,24 @@ class SGLangBackend:
         return {**results, **identity}
 
     def collect_profile(self, instance: Mapping[str, Any], workload: Mapping[str, Any]) -> Record:
-        raise BackendError("real SGLang NPU profile is not available in this provider")
+        from .sglang_profile import collect_profile
+
+        if not self._profile_enabled:
+            raise BackendError("real SGLang NPU profile is disabled for this target")
+        identity = self._observation(instance, workload)
+        workspace = Path(instance["workspace"]).resolve()
+        writable = Path(instance.get("writable_runtime", workspace)).resolve()
+        if not writable.is_relative_to(workspace):
+            raise BackendError("SGLang profile output must stay inside the owned workspace")
+        software = self.probe()["environment"]["software"]
+        output = collect_profile(
+            instance["base_url"], workload, revision=instance["revision"],
+            tool_version=f"SGLang {software['sglang']} / Torch NPU {software['torch_npu']}",
+            directory=writable / "profile", evidence_root=self._session or workspace,
+            request_timeout=self._request_timeout, export_timeout=self._profile_export_timeout,
+        )
+        self._observation(instance, workload)
+        return {**output, **identity}
 
     def device_timer(self, instance: Mapping[str, Any], workload: Mapping[str, Any]) -> Record:
         raise BackendError("real SGLang kernel timing is not available in this provider")

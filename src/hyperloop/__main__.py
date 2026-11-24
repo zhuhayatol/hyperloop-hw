@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .actions.knowledge import load_verified_recipe
+from .agents import provider_config
 from .artifacts import publish_indexes
 from .backends import BackendError
 from .contracts import ContractError, digest, read_json, safe_id, validate_reference, validate_target, validate_task
@@ -46,6 +47,7 @@ def _status(store: SessionStore, state: dict[str, Any]) -> dict[str, Any]:
         "cycle": state["cycle"],
         "last_seq": state["last_seq"],
         "accepted_revision": current.get("id"),
+        "agent_provider": store.manifest.get("scenario", {}).get("agent_provider", {"provider": "replay"}),
         "stop_reason": state.get("stop_reason"),
         "task_counts": dict(task_counts),
         "decisions": decisions,
@@ -64,6 +66,17 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     target = read_json(args.target)
     reference = read_json(args.reference)
     scenario = read_json(args.scenario)
+    if any(key in scenario for key in ("agent_provider", "agent_source_excerpts")):
+        raise ContractError("Agent provider and source excerpts must be selected with run options")
+    if args.agent_provider != "replay" or args.agent_model is not None:
+        scenario["agent_provider"] = provider_config(args.agent_provider, args.agent_model)
+    if args.agent_source_excerpts is not None:
+        if args.agent_provider != "deepseek":
+            raise ContractError("--agent-source-excerpts requires --agent-provider deepseek")
+        source = read_json(args.agent_source_excerpts)
+        if source.keys() != {"excerpts"}:
+            raise ContractError("Agent source excerpt file must contain exactly one excerpts field")
+        scenario["agent_source_excerpts"] = source["excerpts"]
     if "retrieved_recipe" in scenario:
         raise ContractError("retrieved_recipe must be supplied using --recipe")
     if args.recipe is not None:
@@ -192,6 +205,11 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--session-root", type=Path, default=Path("sessions"))
     run.add_argument("--session-id", required=True)
     run.add_argument("--kernel-backend", choices=("forge", "geak", "disabled"))
+    run.add_argument("--agent-provider", choices=("replay", "deepseek"), default="replay",
+                     help="choose fixture replay or the DeepSeek API")
+    run.add_argument("--agent-model", help="DeepSeek model ID (default deepseek-flash)")
+    run.add_argument("--agent-source-excerpts", type=Path,
+                     help="reviewed JSON source blocks to share with DeepSeek for patch proposals")
     run.add_argument("--recipe", type=Path, help="use a completed Session's verified final recipe as guidance")
     run.add_argument("--reference-receipt", type=Path, help="check the separately captured reference provenance")
     run.add_argument("--max-steps", type=positive_steps)

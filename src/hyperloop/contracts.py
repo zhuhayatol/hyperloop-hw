@@ -86,6 +86,10 @@ def _list(value: Any, field: str) -> list[Any]:
 
 def validate_task(task: dict[str, Any]) -> dict[str, Any]:
     safe_id(task.get("id"), "task.id")
+    if "agent_objective" in task:
+        objective = task["agent_objective"]
+        if not isinstance(objective, str) or not objective.strip() or len(objective) > 500 or not objective.isprintable():
+            raise ContractError("task.agent_objective must be a single line of at most 500 characters")
     model = _mapping(task.get("model"), "model")
     for key in ("id", "revision", "tokenizer", "tokenizer_revision", "dtype"):
         _text(model.get(key), f"model.{key}")
