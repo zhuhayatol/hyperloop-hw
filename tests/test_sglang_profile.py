@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from hyperloop.backends.runtime import BackendError
-from hyperloop.backends.sglang_profile import _trace_events, collect_profile
+from hyperloop.backends.sglang_profile import _await_trace, _trace_events, collect_profile
 from hyperloop.evaluation.measurements import rank_hotspots
 
 
@@ -39,6 +39,51 @@ class AscendProfileTests(unittest.TestCase):
         self.assertLess(window[0], window[1])
         hotspots = rank_hotspots({"rank": 0, "events": [*rows, {**rows[0], "phase": "decode"}]})
         self.assertEqual([row["phase"] for row in hotspots], ["prefill", "decode", "prefill"])
+
+    def test_offline_export_uses_same_capture_and_preserves_broken_online_output(self):
+        workload = {"sampling": {"temperature": 0, "ignore_eos": True}, "concurrency": 1,
+                    "requests": [{"id": "long", "phase": "prefill", "input_tokens": [1, 2], "output_tokens": 2}]}
+        with tempfile.TemporaryDirectory() as work, patch("hyperloop.backends.sglang_profile._profile_api") as api, \
+                patch("hyperloop.backends.sglang_profile.os.chown", create=True) as chown, \
+                patch("hyperloop.backends.sglang_profile._complete", return_value={"meta_info": {
+                    "id": "long", "prompt_tokens": 2, "completion_tokens": 2,
+                }}):
+            api.return_value = "Cache flushed."
+            root = Path(work).resolve()
+            broken_contents = '{"traceEvents": ['
+
+            def export(directory, phase):
+                self.assertEqual(api.call_args.args[1], "/stop_profile")
+                self.assertEqual(directory, root / "profile" / "prefill")
+                self.assertEqual(phase, "prefill")
+                capture = directory / "capture"
+                chown.assert_called_once_with(capture, 65534, 1000)
+                start = next(call for call in api.call_args_list if call.args[1] == "/start_profile")
+                self.assertEqual(start.args[3]["output_dir"], str(capture))
+                self.assertEqual(start.args[3]["num_steps"], 4)
+                (capture / "trace_view.json").write_text(broken_contents, encoding="utf-8")
+                result = directory / "offline-export" / "trace_view.json"
+                result.parent.mkdir()
+                result.write_text(json.dumps(trace()), encoding="utf-8")
+                return result, {"raw_capture_sha256": "verified-source"}
+
+            profile = collect_profile("http://127.0.0.1:30000", workload, revision="base", tool_version="v0.5.16",
+                                      directory=root / "profile", evidence_root=root, request_timeout=3, export_timeout=5,
+                                      output_owner=(65534, 1000), offline_export=export, steps=4)
+            phase = profile["capture"]["phases"][0]
+            self.assertEqual(phase["trace"]["path"], "profile/prefill/offline-export/trace_view.json")
+            self.assertEqual(phase["trace"]["kernel_events"], 1)
+            self.assertEqual(phase["num_steps"], 4)
+            self.assertEqual(phase["export"], {"method": "offline_same_capture",
+                                               "receipt": {"raw_capture_sha256": "verified-source"}})
+            self.assertEqual((root / "profile" / "prefill" / "capture" / "trace_view.json").read_text(encoding="utf-8"),
+                             broken_contents)
+
+    def test_offline_export_cannot_select_another_capture(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work).resolve()
+            with self.assertRaisesRegex(BackendError, "owned phase capture directory"):
+                _await_trace(root / "prefill", "prefill", root, 1, exported=root / "other" / "trace_view.json")
 
     def test_trace_does_not_infer_callsite_from_ambiguous_flow_or_cpu_only_trace(self):
         events = trace()

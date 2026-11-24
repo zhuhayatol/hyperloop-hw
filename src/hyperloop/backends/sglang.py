@@ -23,6 +23,7 @@ from uuid import uuid4
 
 from .runtime import BackendError, Record, fingerprint
 from .sglang_overlay import dedicated_launch, loaded_sources, protected_paths, sandbox_launch, source_edit, source_path, stage_overlay
+from .sglang_profile_export import export_capture, exporter_owner
 
 
 _HOST = "127.0.0.1"
@@ -288,11 +289,17 @@ class SGLangBackend:
         self._startup_timeout = _time_limit(config, "startup_timeout", 240)
         self._request_timeout = _time_limit(config, "request_timeout", 120)
         profile = config.get("profile", {})
-        if (not isinstance(profile, Mapping) or profile.keys() - {"enabled", "export_timeout"}
-                or type(profile.get("enabled", False)) is not bool):
-            raise BackendError("target.sglang.profile must define boolean enabled and optional export_timeout")
+        if (not isinstance(profile, Mapping) or profile.keys() - {"enabled", "export_timeout", "offline_export", "steps"}
+                or type(profile.get("enabled", False)) is not bool
+                or type(profile.get("offline_export", False)) is not bool):
+            raise BackendError("target.sglang.profile requires valid enabled, offline_export, steps and export_timeout")
         self._profile_enabled = profile.get("enabled", False)
         self._profile_export_timeout = _time_limit(profile, "export_timeout", 120)
+        self._profile_steps = profile.get("steps")
+        if self._profile_steps is not None and (type(self._profile_steps) is not int or self._profile_steps <= 0):
+            raise BackendError("target.sglang.profile.steps must be a positive integer")
+        if profile.get("offline_export") and (not self._profile_enabled or not self._trial_user):
+            raise BackendError("offline Ascend export requires an enabled Profile and isolated capture user")
         self._native_geak = config.get("native_geak", False)
         self._native_forge = config.get("native_forge", False)
         if type(self._native_geak) is not bool or type(self._native_forge) is not bool:
@@ -311,6 +318,7 @@ class SGLangBackend:
         self._env = {key: value for key, value in os.environ.items() if not _provider_credential(key)}
         self._env.update({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
                           "TOKENIZERS_PARALLELISM": "false", "PYTHONDONTWRITEBYTECODE": "1"})
+        self._profile_export_owner = exporter_owner(self._env, self._trial_user) if profile.get("offline_export") else None
 
     def bind_session(self, path: Path) -> None:
         self._session = path.resolve()
@@ -421,6 +429,13 @@ class SGLangBackend:
                                                      "dedicated_run_uid": uid, "dedicated_run_gid": gid}
             if self._ascend_use_fia is not None:
                 environment["stock_attention_control"] = {"ASCEND_USE_FIA": self._ascend_use_fia, "ASCEND_USE_FA": False}
+            if self._profile_export_owner is not None:
+                uid, gid, binary = self._profile_export_owner
+                environment["offline_profile_export"] = {
+                    "uid": uid, "gid": gid, "msprof": str(binary), "sha256": self._file_hash(binary),
+                }
+            if self._profile_steps is not None:
+                environment["profile_scheduler_steps"] = self._profile_steps
         except (OSError, KeyError, IndexError, ValueError, TypeError) as error:
             raise BackendError(f"could not confirm the real SGLang environment: {error}") from error
         capabilities = ["benchmark", "verify"]
@@ -682,10 +697,17 @@ class SGLangBackend:
             tool_version=f"SGLang {software['sglang']} / Torch NPU {software['torch_npu']}",
             directory=writable / "profile", evidence_root=self._session or workspace,
             request_timeout=self._request_timeout, export_timeout=self._profile_export_timeout,
-            output_owner=self._trial_user,
+            output_owner=self._trial_user, steps=self._profile_steps,
+            offline_export=self._export_profile if self._profile_export_owner is not None else None,
         )
         self._observation(instance, workload)
         return {**output, **identity}
+
+    def _export_profile(self, phase_directory: Path, _: str) -> tuple[Path, Record]:
+        return export_capture(
+            phase_directory, python=self._python, environment=self._env, owner=self._profile_export_owner,
+            timeout=self._profile_export_timeout,
+        )
 
     def device_timer(self, instance: Mapping[str, Any], workload: Mapping[str, Any]) -> Record:
         raise BackendError("real SGLang kernel timing is not available in this provider")

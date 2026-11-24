@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
@@ -23,6 +23,7 @@ _KERNEL_TASKS = {"AI_CORE", "AI_VECTOR_CORE", "AI_CPU", "MIX_AIC", "MIX_AIV"}
 _MAX_TRACE_BYTES = 256 * 1024 * 1024
 _SGLANG_FRAME = re.compile(r"(?:^|[/\\])(?P<file>sglang[/\\](?:srt|lang)[/\\][^;\r\n()]+\.py)"
                            r"\((?P<line>\d+)\)")
+OfflineExport = Callable[[Path, str], tuple[Path, Record]]
 
 
 def _number(value: Any) -> Decimal | None:
@@ -137,11 +138,17 @@ def _read_trace(path: Path, phase: str, evidence_root: Path) -> tuple[list[Recor
                   "resolved_callsites": sum(bool(row["callsite"]) for row in rows)}
 
 
-def _await_trace(directory: Path, phase: str, evidence_root: Path, timeout: float) -> tuple[list[Record], Record]:
+def _await_trace(
+    directory: Path, phase: str, evidence_root: Path, timeout: float, *, exported: Path | None = None,
+) -> tuple[list[Record], Record]:
+    if exported is not None and (not exported.is_absolute() or exported.name != "trace_view.json"
+                                 or not exported.resolve().is_relative_to(directory.resolve())):
+        raise BackendError("Offline Ascend trace must stay inside its owned phase capture directory")
     deadline = monotonic() + timeout
     last_error = "trace_view.json has not been exported"
     while True:
-        traces = sorted(path for path in directory.rglob("trace_view.json") if path.is_file())
+        paths = directory.rglob("trace_view.json") if exported is None else (exported,)
+        traces = sorted(path for path in paths if path.is_file())
         if len(traces) > 1:
             raise BackendError(f"Expected one Ascend Chrome trace for the {phase} window, found {len(traces)}")
         if traces:
@@ -167,11 +174,17 @@ def _profile_api(base_url: str, endpoint: str, timeout: float, body: Record | No
 def _profile_phase(
     base_url: str, workload: Mapping[str, Any], phase: str, requests: list[Record], directory: Path,
     *, evidence_root: Path, request_timeout: float, export_timeout: float, output_owner: tuple[int, int] | None,
+    offline_export: OfflineExport | None, steps: int | None,
 ) -> tuple[list[Record], Record]:
+    capture_directory = directory
     try:
-        directory.mkdir(parents=True, mode=0o750 if output_owner else 0o777, exist_ok=False)
+        if offline_export is not None:
+            # The trial may write only its capture; the trusted exporter owns its sibling output.
+            directory.mkdir(parents=True, mode=0o755, exist_ok=False)
+            capture_directory = directory / "capture"
+        capture_directory.mkdir(parents=True, mode=0o750 if output_owner else 0o777, exist_ok=False)
         if output_owner is not None:
-            os.chown(directory, *output_owner)
+            os.chown(capture_directory, *output_owner)
     except OSError as error:
         raise BackendError(f"Could not create the owned {phase} profile directory: {error}") from error
     # Warm the service once for this shape and remove any radix-cache prefix before capture.
@@ -179,9 +192,13 @@ def _profile_phase(
     cache_ack = _profile_api(base_url, "/flush_cache", request_timeout)
     if not cache_ack.casefold().startswith("cache flushed."):
         raise BackendError(f"SGLang did not confirm cache flush before the {phase} profile: {cache_ack}")
-    start_ack = _profile_api(base_url, "/start_profile", request_timeout, {
-        "output_dir": str(directory), "activities": list(_ACTIVITIES), "with_stack": True, "record_shapes": True,
-    })
+    profile_options = {
+        "output_dir": str(capture_directory), "activities": list(_ACTIVITIES), "with_stack": True,
+        "record_shapes": True,
+    }
+    if steps is not None:
+        profile_options["num_steps"] = steps
+    start_ack = _profile_api(base_url, "/start_profile", request_timeout, profile_options)
     workers = min(workload["concurrency"], len(requests))
     try:
         payloads = [_payload(request, workload, stream=False) for request in requests]
@@ -195,19 +212,30 @@ def _profile_phase(
             raise BackendError(f"{error}; could not stop the Ascend profile: {stop_error}") from error
         raise
     stop_ack = _profile_api(base_url, "/stop_profile", export_timeout, {})
-    rows, trace = _await_trace(directory, phase, evidence_root, export_timeout)
+    exported, export_receipt = offline_export(directory, phase) if offline_export is not None else (None, None)
+    if offline_export is not None and (not isinstance(exported, Path) or not isinstance(export_receipt, dict)):
+        raise BackendError("Offline Ascend exporter must return its trace path and receipt")
+    rows, trace = _await_trace(directory, phase, evidence_root, export_timeout, exported=exported)
     cases = [{"request_id": request["id"], "server_request_id": meta["id"],
               "input_tokens": meta["prompt_tokens"], "output_tokens": meta["completion_tokens"]}
              for request, meta in zip(requests, observations)]
-    return rows, {"phase": phase, "trace": trace, "requests": cases, "concurrency": workers,
-                  "start_ack": start_ack, "stop_ack": stop_ack, "cache_ack": cache_ack}
+    capture = {"phase": phase, "trace": trace, "requests": cases, "concurrency": workers,
+               "start_ack": start_ack, "stop_ack": stop_ack, "cache_ack": cache_ack}
+    if export_receipt is not None:
+        capture["export"] = {"method": "offline_same_capture", "receipt": export_receipt}
+    if steps is not None:
+        capture["num_steps"] = steps
+    return rows, capture
 
 
 def collect_profile(
     base_url: str, workload: Mapping[str, Any], *, revision: str, tool_version: str, directory: Path,
     evidence_root: Path, request_timeout: float, export_timeout: float, output_owner: tuple[int, int] | None = None,
+    offline_export: OfflineExport | None = None, steps: int | None = None,
 ) -> Record:
     """Export one distinct rank-zero trace per frozen request group, outside performance timing."""
+    if steps is not None and (type(steps) is not int or steps < 1):
+        raise BackendError("Ascend profiling steps must be a positive integer")
     grouped: dict[str, list[Record]] = {phase: [] for phase in _PHASES}
     for case in workload["requests"]:
         phase = case.get("phase")
@@ -221,7 +249,8 @@ def collect_profile(
             continue
         rows, capture = _profile_phase(base_url, workload, phase, cases, directory / phase,
                                        evidence_root=evidence_root, request_timeout=request_timeout,
-                                       export_timeout=export_timeout, output_owner=output_owner)
+                                       export_timeout=export_timeout, output_owner=output_owner,
+                                       offline_export=offline_export, steps=steps)
         phases.append(capture)
         events.extend(rows)
     if not phases:
