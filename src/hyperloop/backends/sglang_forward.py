@@ -138,6 +138,7 @@ def measure_forward(
         with control.open("x", encoding="utf-8") as stream:
             stream.write(accession + "\n")
         try:
+            control.chmod(0o644)
             with ThreadPoolExecutor(max_workers=concurrency) as pool:
                 pending = [pool.submit(_complete, base_url, payload, timeout) for payload in payloads]
                 replies = [job.result() for job in pending]
@@ -158,6 +159,8 @@ def measure_forward(
         "boundary": "model_forward", "method": "torch.npu.Event on the model's current stream",
         "model_symbol": FORWARD_SYMBOL, "profile_enabled": False, "graph_replay": False,
         "http_role": "drive frozen requests outside the event boundary", "concurrency": concurrency,
+        "cache_policy": "flush the radix cache before each capture window",
+        "warmup_policy": "complete the untimed frozen-output verification before opening a capture window",
         "repeats": captured,
         "samples_ms": [row["elapsed_ms"] for repeat in captured for row in repeat["samples"]],
         "phases": {phase: {"count": len(values), "median_ms": median(values)} for phase, values in phases.items()},
