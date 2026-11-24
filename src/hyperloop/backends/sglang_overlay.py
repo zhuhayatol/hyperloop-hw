@@ -237,8 +237,19 @@ def dedicated_launch(
     except OSError as error:
         raise BackendError(f"could not create the dedicated account's runtime directory: {error}") from error
     child_env = _runtime_environment(environment, runtime, source, str(runtime / "tmp"))
+    require_unprivileged = """\
+import os
+import sys
+
+with open('/proc/self/status', encoding='ascii') as stream:
+    status = dict(line.split(':', 1) for line in stream if ':' in line)
+caps = ('CapInh', 'CapPrm', 'CapEff', 'CapAmb')
+if (status['NoNewPrivs'].strip() != '1' or any(int(status[name], 16) for name in caps)):
+    raise SystemExit('Dedicated SGLang account retained process privileges')
+os.execv(sys.argv[1], sys.argv[1:])
+"""
     return ["/usr/bin/setpriv", f"--reuid={uid}", f"--regid={gid}", "--clear-groups", "--no-new-privs",
-            "--inh-caps=-all", "--ambient-caps=-all", "--bounding-set=-all", "--", *command], child_env, runtime
+            "--", command[0], "-c", require_unprivileged, *command], child_env, runtime
 
 
 def loaded_sources(log: Path, source: Mapping[str, Any]) -> list[Record]:
