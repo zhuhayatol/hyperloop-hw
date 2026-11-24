@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperloop · 910B3 单卡初验信号流</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f5f7fa;
+  --panel: #fff;
+  --ink: #142238;
+  --muted: #47576c;
+  --line: #cdd8e4;
+  --link: #225382;
+  --soft: #e8f2fa;
+  --real: #36563b;
+  --real-bg: #e8f4e6;
+  --replay: #814a12;
+  --replay-bg: #fbedd9;
+  --warn: #7b3540;
+  --warn-bg: #faeeeb;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #111b29;
+    --panel: #182638;
+    --ink: #e6eef8;
+    --muted: #b5c6da;
+    --line: #3d536d;
+    --link: #9ecbf4;
+    --soft: #203750;
+    --real: #a5d39f;
+    --real-bg: #243a31;
+    --replay: #f5c487;
+    --replay-bg: #3c2e25;
+    --warn: #f5a99f;
+    --warn-bg: #462f35;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-padding-top: 1rem; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 system-ui, "Microsoft YaHei", sans-serif; }
+main { max-width: 1110px; padding: 34px 24px 48px; margin: auto; }
+h1 { margin: 0 0 8px; font-size: clamp(25px, 4vw, 42px); line-height: 1.2; letter-spacing: -.02em; }
+h2 { margin: 0 0 8px; font-size: 21px; }
+h3 { margin: 0; font-size: 16px; }
+p { margin: 0; }
+a { color: var(--link); text-underline-offset: 3px; }
+a:focus-visible, summary:focus-visible { outline: 2px solid var(--link); outline-offset: 3px; }
+code { font: .95em ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
+.lead { color: var(--muted); max-width: 750px; }
+.nav { display: flex; flex-wrap: wrap; gap: 7px 18px; margin: 12px 0 20px; font-size: 14px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 11px; margin: 0 0 13px; padding: 16px 19px; }
+.panel-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px 12px; }
+.label { display: inline-block; border-radius: 5px; padding: 2px 6px; background: var(--soft); color: var(--link); font-size: 12px; font-weight: 680; }
+.label[data-type="real"] { background: var(--real-bg); color: var(--real); }
+.label[data-type="replay"] { background: var(--replay-bg); color: var(--replay); }
+.label[data-type="failure"] { background: var(--warn-bg); color: var(--warn); }
+.note { color: var(--muted); margin: 3px 0 9px; }
+.facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0; }
+.facts div { min-width: 0; padding: 8px 10px; background: var(--bg); border-radius: 6px; }
+.facts dt { color: var(--muted); font-size: 13px; }
+.facts dd { margin: 2px 0 0; font-weight: 620; overflow-wrap: anywhere; }
+.flow { display: grid; gap: 5px; list-style: none; margin: 0; padding: 0; }
+.handoff, .flow-head { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.7fr) minmax(0, 1fr); align-items: stretch; gap: 7px; }
+.flow-head { margin-bottom: 5px; color: var(--muted); font-size: 12px; }
+.flow-head span:nth-child(2) { text-align: center; }
+.node { display: grid; align-content: center; padding: 7px 9px; min-width: 0; border: 1px solid var(--line); border-radius: 6px; font-size: 13px; font-weight: 650; overflow-wrap: anywhere; }
+.node[data-type="real"] { border-left: 3px solid var(--real); background: var(--real-bg); color: var(--real); }
+.node[data-type="replay"] { border-left: 3px solid var(--replay); background: var(--replay-bg); color: var(--replay); }
+.message { display: grid; justify-items: center; align-content: center; gap: 2px; padding: 4px 2px; font-size: 13px; text-align: center; overflow-wrap: anywhere; }
+.message::after { content: ""; width: min(54px, 100%); height: 6px; background: var(--link); clip-path: polygon(0 36%, calc(100% - 6px) 36%, calc(100% - 6px) 0, 100% 50%, calc(100% - 6px) 100%, calc(100% - 6px) 64%, 0 64%); }
+details { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 8px; }
+summary { cursor: pointer; color: var(--link); font-weight: 620; }
+details p, .links { margin-top: 6px; }
+.links { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.gates { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 8px; }
+.gates article { border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; min-width: 0; }
+.gates p { color: var(--muted); }
+@media (max-width: 680px) {
+  main { padding: 22px 12px 30px; }
+  .panel { padding: 12px; }
+  .facts, .gates { grid-template-columns: minmax(0, 1fr); }
+  .handoff, .flow-head { grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr) minmax(0, 1fr); gap: 4px; }
+  .node { padding: 5px 4px; }
+  .node, .message { font-size: 12px; }
+}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Hyperloop · 910B3 单卡初验</h1>
+    <p class="lead">独立启动原版，锁定固定输入的输出 token。正式会话先测原版，再用同一输入校验参数候选，校验通过才计时。</p>
+    <nav class="nav" aria-label="验证导航">
+      <a href="#result">本次结果</a>
+      <a href="#input">验证输入</a>
+      <a href="#reference">采集参考</a>
+      <a href="#dispatch">任务派发</a>
+      <a href="#measure">真机评测</a>
+      <a href="#decision">如何裁决</a>
+      <a href="优化任务与交付架构.html">项目总图</a>
+    </nav>
+  </header>
+
+  <section class="panel" id="result" aria-labelledby="result-title">
+    <div class="panel-header">
+      <h2 id="result-title">本次结果</h2>
+      <!-- BEGIN RUN STATUS -->
+      <span id="result-status" class="label">等待会话证据</span>
+      <!-- END RUN STATUS -->
+    </div>
+    <!-- BEGIN RUN RESULTS -->
+    <dl class="facts">
+      <div><dt>原始基线</dt><dd id="result-baseline">待填</dd></div>
+      <div><dt>参数候选</dt><dd id="result-candidate">待填</dd></div>
+      <div><dt>版本裁决</dt><dd id="result-verdict">待填</dd></div>
+    </dl>
+    <p class="note" id="result-scope">完成后从本页进入会话报告和原始证据。</p>
+    <!-- END RUN RESULTS -->
+    <div class="links" id="result-links">
+      <a href="910B3部署与初验.md">迁移与部署日志</a>
+      <!-- BEGIN RUN EVIDENCE -->
+      <!-- 在这里加入 real Session 报告、参考输出和原始证据的相对链接。 -->
+      <!-- END RUN EVIDENCE -->
+    </div>
+  </section>
+
+  <section class="panel" id="input" aria-labelledby="input-title">
+    <h2 id="input-title">验证输入</h2>
+    <!-- BEGIN RUN INPUTS -->
+    <dl class="facts">
+      <div><dt>环境</dt><dd id="input-environment">昇腾 910B3 单卡 · TP=1 · SGLang</dd></div>
+      <div><dt>请求</dt><dd id="input-requests">固定输入 token，与预设生成长度成对运行</dd></div>
+      <div><dt>比较对象</dt><dd id="input-parameters">原始基线与只改一个参数的候选</dd></div>
+    </dl>
+    <!-- END RUN INPUTS -->
+    <p class="note">会话预先锁定设备、模型、启动参数、请求、并发、预热、重复次数和验收门槛。</p>
+  </section>
+
+  <section class="panel" id="reference" aria-labelledby="reference-title">
+    <div class="panel-header">
+      <h2 id="reference-title">独立采集原版 Reference</h2>
+      <span class="label" data-type="real">真机路径</span>
+    </div>
+    <ol class="flow">
+      <li class="handoff"><span class="node">评测器 Evaluator</span><span class="message">原版配置与固定输入</span><span class="node" data-type="real">隔离启动的 SGLang</span></li>
+      <li class="handoff"><span class="node" data-type="real">SGLang <code>/generate</code></span><span class="message">逐请求输出 token ID</span><span class="node">参考输出采集</span></li>
+      <li class="handoff"><span class="node">参考输出采集</span><span class="message">参考输出、身份与原始响应</span><span class="node">独立参考证据</span></li>
+    </ol>
+    <p class="note">采集完成后关闭参考服务。正式会话另起实例，用已保存的输出做对照。</p>
+  </section>
+
+  <section class="panel" id="dispatch" aria-labelledby="dispatch-title">
+    <div class="panel-header">
+      <h2 id="dispatch-title">登记与派发</h2>
+      <span class="label" data-type="replay">候选由固定回复提交</span>
+    </div>
+    <div class="flow-head" aria-hidden="true"><span>发送方</span><span>交接内容</span><span>接收方</span></div>
+    <ol class="flow">
+      <li class="handoff"><span class="node">Coordinator</span><span class="message">内部任务 · 测原始基线</span><span class="node">Intent Router</span></li>
+      <li class="handoff"><span class="node" data-type="replay">Orchestration 回放</span><span class="message">直接委派 · 试预写的参数候选</span><span class="node">Intent Router</span></li>
+      <li class="handoff"><span class="node">Intent Router</span><span class="message">核对权限、阶段和参数，登记入队</span><span class="node">Dispatcher</span></li>
+      <li class="handoff"><span class="node">Dispatcher</span><span class="message">预算及资源允许，启动基线或 Explore</span><span class="node">执行模块与 Evaluator</span></li>
+    </ol>
+    <p class="note">基线先完成后再登记参数候选。调参走直接委派，测后由独立裁决复核证据。</p>
+  </section>
+
+  <section class="panel" id="measure" aria-labelledby="measure-title">
+    <div class="panel-header">
+      <h2 id="measure-title">SGLang 真机校验与计时</h2>
+      <span class="label" data-type="real">样本来自 NPU 服务</span>
+    </div>
+    <ol class="flow">
+      <li class="handoff"><span class="node">Evaluator</span><span class="message">明确版本、启动参数和待测请求</span><span class="node" data-type="real">SGLang 适配器</span></li>
+      <li class="handoff"><span class="node" data-type="real">SGLang 适配器</span><span class="message">固定输入 token 与生成长度</span><span class="node" data-type="real">SGLang <code>/generate</code></span></li>
+      <li class="handoff"><span class="node" data-type="real">SGLang <code>/generate</code></span><span class="message">输出 token IDs 与实际请求长度</span><span class="node">Verifier 正确性检查</span></li>
+      <li class="handoff"><span class="node">Verifier</span><span class="message">确认版本与 Reference 匹配，才开始计时</span><span class="node">BenchmarkRunner</span></li>
+      <li class="handoff"><span class="node" data-type="real">SGLang <code>/generate</code></span><span class="message">服务返回流式响应，客户端记录首 token 与完成时间</span><span class="node">BenchmarkRunner</span></li>
+      <li class="handoff"><span class="node">Verifier 与 BenchmarkRunner</span><span class="message">输出核验、重复样本和环境身份</span><span class="node">Session 证据</span></li>
+    </ol>
+    <details>
+      <summary>三项指标从哪里来</summary>
+      <p>吞吐用整个测量窗口内的生成 token 数计算。TTFT 是请求到首个输出 token 的时间，TPOT 是首个 token 后平均每个 token 的时间。</p>
+    </details>
+  </section>
+
+  <section class="panel" id="decision" aria-labelledby="decision-title">
+    <h2 id="decision-title">独立裁决与会话报告</h2>
+    <ol class="flow">
+      <li class="handoff"><span class="node">Session 证据</span><span class="message">读原始版、父版、候选与锁定门槛</span><span class="node">独立裁决</span></li>
+      <li class="handoff"><span class="node">独立裁决</span><span class="message">KEEP、REVERT 或 HOLD，附理由</span><span class="node">Coordinator 写回</span></li>
+      <li class="handoff"><span class="node">Coordinator 写回</span><span class="message">存版本决定、事件与报告链接</span><span class="node">Session 报告</span></li>
+    </ol>
+    <div class="gates">
+      <article><h3>正确性</h3><p>固定请求的输出须匹配独立 Reference。失败即退回候选并跳过性能计时。</p></article>
+      <article><h3>性能与证据</h3><p>同条件复测，收益达标且守住延迟门槛才保留。回归或收益不足予以退回。证据不足时暂缓裁决。</p></article>
+    </div>
+  </section>
+</main>
+</body>
+</html>

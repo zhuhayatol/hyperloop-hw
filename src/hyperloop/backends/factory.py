@@ -22,6 +22,10 @@ def build_runtime(
     """Give providers copies so their inputs remain frozen by the Coordinator."""
     if factory is not None:
         return factory(deepcopy(target), deepcopy(scenario))
+    if target.get("mode") == "real" and target.get("provider") == "sglang":
+        from .sglang import SGLangBackend
+
+        return SGLangBackend(deepcopy(target))
     if target.get("mode") != "simulated":
         raise ContractError("a real target requires an explicitly supplied runtime provider")
     revisions = scenario.get("revisions")
@@ -62,9 +66,11 @@ def checked_probe(
         or len(set(ranks.values())) != len(ranks)
     ):
         raise ContractError("runtime probe has an invalid rank-to-device mapping")
-    software = environment.get("software", {})
-    if not isinstance(software, dict) or any(software.get(key) != value for key, value in target.get("software", {}).items()):
-        raise ContractError("runtime probe does not match target.software")
+    for field in ("software", "model_sha256", "tokenizer_sha256"):
+        observed = environment.get(field, {})
+        expected = target.get(field, {})
+        if not isinstance(observed, dict) or any(observed.get(key) != value for key, value in expected.items()):
+            raise ContractError(f"runtime probe does not match target.{field}")
     capabilities = probe.get("capabilities")
     if (
         not isinstance(capabilities, list)

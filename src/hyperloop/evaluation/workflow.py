@@ -17,6 +17,7 @@ from .measurements import (
     benchmark_sample,
     change_ratios,
     correctness,
+    keyed_rows,
     numeric,
     rank_hotspots,
     summarize,
@@ -86,6 +87,39 @@ class Evaluator:
     def __init__(self, backend: RuntimeBackend, workspace_root: Path) -> None:
         self.backend = backend
         self.workspace_root = Path(workspace_root)
+
+    def capture_reference(
+        self, revision: str, workload: Mapping[str, Any], *, expected_stack: Mapping[str, Any],
+    ) -> Record:
+        """Record service outputs from a separate, unmodified baseline instance."""
+        frozen = copy.deepcopy(dict(workload))
+
+        def operation(attempt: _ValidationAttempt, context: Record, result: Record) -> None:
+            with self._service(attempt, context, revision, "reference", "framework", expected_stack) as instance:
+                result["runtime"] = instance
+                with attempt.exchange("Evaluator", "RuntimeBackend", "observe_outputs", "reference",
+                                      "请求原始版的固定输入", "返回原始版输出", "workload"):
+                    raw = self.backend.observe_outputs(
+                        copy.deepcopy(instance), copy.deepcopy(frozen), scope="service",
+                    )
+                    attempt.save("reference_service_outputs", raw, "runtime_backend")
+                self._assert_observation(raw, instance, context)
+                if raw.get("scope") != "service":
+                    raise EvidenceProblem("correctness_scope_mismatch", "incomparable")
+                cases = keyed_rows(raw.get("cases"), "request_id")
+                if cases.keys() != context["requests"].keys():
+                    raise EvidenceProblem("correctness_cases_missing", "missing", "partial")
+                observed = {request_id: row.get("output") for request_id, row in cases.items()}
+                if any(not isinstance(values, list) or not values for values in observed.values()):
+                    raise EvidenceProblem("reference_outputs_missing", "missing", "partial")
+                checked = correctness(raw, context["requests"], observed, 0, frozen["dtype"])
+                if not checked["pass"]:
+                    raise EvidenceProblem("reference_outputs_invalid")
+                attempt.save("captured_reference", observed, "evaluation")
+                result["reference"] = observed
+            _positive_outcome(result, "reference_capture_complete")
+
+        return self._run(frozen, "reference-capture", {"verify"}, operation)
 
     def baseline(
         self,

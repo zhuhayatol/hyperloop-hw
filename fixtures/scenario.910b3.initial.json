@@ -1,0 +1,27 @@
+{
+  "agents": {
+    "orchestration": [
+      [
+        {
+          "kind": "delegate",
+          "action": "explore",
+          "idempotency_key": "ascend-initial-chunk",
+          "params": {
+            "candidates": [
+              {
+                "id": "R01",
+                "parameters": {
+                  "chunked_prefill_size": 256
+                },
+                "reason": "Controlled initial validation of a smaller prefill chunk on the same Ascend service.",
+                "expected_metric": "service throughput",
+                "risk": "A smaller chunk can increase latency or change deterministic token outputs.",
+                "validation": "Compare exact outputs against the original service and repeat matched end-to-end measurements."
+              }
+            ]
+          }
+        }
+      ]
+    ]
+  }
+}

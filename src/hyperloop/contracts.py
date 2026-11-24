@@ -169,6 +169,7 @@ def validate_target(target: dict[str, Any]) -> dict[str, Any]:
     tp_size = _integer(target.get("tp_size"), "target.tp_size", minimum=1)
     if tp_size > len(devices):
         raise ContractError("target.tp_size exceeds visible devices")
-    if "software" in target:
-        _mapping(target["software"], "target.software")
+    for field in ("software", "model_sha256", "tokenizer_sha256"):
+        if field in target:
+            _mapping(target[field], f"target.{field}")
     return target

@@ -11,9 +11,10 @@ from typing import Any
 
 from .actions.knowledge import load_verified_recipe
 from .artifacts import publish_indexes
-from .contracts import ContractError, read_json, safe_id
+from .backends import BackendError
+from .contracts import ContractError, digest, read_json, safe_id, validate_reference, validate_target, validate_task
 from .report import write_report
-from .session import SessionBusy, SessionStore, project
+from .session import SessionBusy, SessionStore, atomic_write, project
 
 
 def positive_steps(value: str) -> int:
@@ -60,20 +61,77 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         if not isinstance(settings, dict):
             raise ValueError("task.settings must be an object")
         settings["kernel_backend"] = args.kernel_backend
+    target = read_json(args.target)
+    reference = read_json(args.reference)
     scenario = read_json(args.scenario)
     if "retrieved_recipe" in scenario:
         raise ContractError("retrieved_recipe must be supplied using --recipe")
     if args.recipe is not None:
         scenario["retrieved_recipe"] = load_verified_recipe(args.recipe)
+    if "reference_capture" in scenario:
+        raise ContractError("reference_capture must be supplied using --reference-receipt")
+    if args.reference_receipt is not None:
+        capture = read_json(args.reference_receipt)
+        validate_task(task)
+        identity = _reference_identity(task, target, reference)
+        if capture.get("status") != "ok" or any(capture.get(key) != value for key, value in identity.items()):
+            raise ContractError("reference capture does not match the task, target and reference")
+        scenario["reference_capture"] = capture
     coordinator = Coordinator.create(
         args.session_root,
         args.session_id,
         task,
-        read_json(args.target),
-        read_json(args.reference),
+        target,
+        reference,
         scenario,
     )
     return _status(coordinator.store, coordinator.run(max_steps=args.max_steps))
+
+
+def _reference_identity(task: dict, target: dict, reference: dict) -> dict[str, str]:
+    return {
+        "initial_revision": task["initial_revision"],
+        "model_sha256": digest(task["model"]),
+        "workload_sha256": digest(task["workload"]),
+        "target_sha256": digest(target),
+        "reference_sha256": digest(reference),
+    }
+
+
+def _capture_reference(args: argparse.Namespace) -> dict[str, Any]:
+    from .actions.candidates import original_revision, stack_identity
+    from .backends.factory import build_runtime, checked_probe
+    from .evaluation import Evaluator
+
+    task = validate_task(read_json(args.task))
+    target = validate_target(read_json(args.target))
+    if target["mode"] != "real":
+        raise ContractError("reference capture requires a real target")
+    revision = original_revision(task["initial_revision"])
+    backend = build_runtime(target, {}, revision["id"], None)
+    probe = checked_probe(backend, target, mode="real")
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    backend.bind_revision(revision, expected_stack=stack_identity(revision))
+    capture = Evaluator(backend, output).capture_reference(
+        revision["id"], task["workload"], expected_stack=stack_identity(revision),
+    )
+    receipt = {key: capture[key] for key in ("status", "reason", "attempt_id", "evidence")}
+    reference_file = output / "reference.json"
+    receipt_file = output / "capture.json"
+    if capture["status"] == "ok" and (
+        capture["runtime"]["environment_fingerprint"] == probe["environment_fingerprint"]
+    ):
+        reference = validate_reference(capture["reference"], task)
+        receipt.update(_reference_identity(task, target, reference))
+        receipt.update(environment_fingerprint=probe["environment_fingerprint"], mode="real")
+        atomic_write(reference_file, (json.dumps(reference, indent=2, allow_nan=False) + "\n").encode())
+    elif capture["status"] == "ok":
+        receipt.update(status="failed", reason="reference_environment_changed")
+    atomic_write(receipt_file, (json.dumps(receipt, indent=2, allow_nan=False) + "\n").encode())
+    if receipt["status"] != "ok":
+        raise ContractError(f"reference capture failed ({receipt['reason']}); see {receipt_file}")
+    return {"mode": "real", "reference": str(reference_file), "receipt": str(receipt_file)}
 
 
 def _resume(args: argparse.Namespace) -> dict[str, Any]:
@@ -135,8 +193,14 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--session-id", required=True)
     run.add_argument("--kernel-backend", choices=("forge", "geak", "disabled"))
     run.add_argument("--recipe", type=Path, help="use a completed Session's verified final recipe as guidance")
+    run.add_argument("--reference-receipt", type=Path, help="check the separately captured reference provenance")
     run.add_argument("--max-steps", type=positive_steps)
     run.set_defaults(handler=_run)
+
+    reference = commands.add_parser("capture-reference", help="capture outputs from the unmodified real service")
+    for name in ("task", "target", "output"):
+        reference.add_argument(f"--{name}", type=Path, required=True)
+    reference.set_defaults(handler=_capture_reference)
 
     resume = commands.add_parser("resume", help="continue a Session using its frozen inputs")
     resume.add_argument("session", type=Path)
@@ -162,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         result = args.handler(args)
-    except (ValueError, OSError, SessionBusy) as error:
+    except (ValueError, OSError, SessionBusy, BackendError) as error:
         print(f"hyperloop: {error}", file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=True, indent=2, allow_nan=False))

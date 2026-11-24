@@ -35,6 +35,12 @@ class Coordinator:
         ReplayAgentBackend(scenario.get("agents", {}))
         backend = build_runtime(target, scenario, task["initial_revision"], backend_factory)
         runtime = checked_probe(backend, target, mode=target["mode"])
+        capture = scenario.get("reference_capture")
+        if capture is not None and (
+            not isinstance(capture, dict)
+            or capture.get("environment_fingerprint") != runtime["environment_fingerprint"]
+        ):
+            raise ContractError("reference capture environment does not match the runtime probe")
         store = SessionStore.create(root, target["mode"], session_id, {
             "task": task, "target": target, "reference": reference, "scenario": scenario,
             "runtime": runtime,
@@ -65,6 +71,9 @@ class Coordinator:
         self.backend = _backend if _backend is not None else build_runtime(
             store.manifest["target"], self.scenario, self.task["initial_revision"], backend_factory,
         )
+        bind_session = getattr(self.backend, "bind_session", None)
+        if bind_session is not None:
+            bind_session(store.path)
         self.actions = RuntimeActions(store, self.backend)
         self.agents = ReplayAgentBackend(self.scenario.get("agents", {}))
         self.dispatcher = Dispatcher(emit=self._emit)
