@@ -2,10 +2,12 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from hyperloop.backends.runtime import BackendError
-from hyperloop.backends.sglang_overlay import loaded_sources, sandbox_launch, source_edit, stage_overlay
+from hyperloop.backends.sglang_overlay import dedicated_launch, loaded_sources, protected_paths, sandbox_launch, source_edit, stage_overlay
 from scripts.diagnose_ascend_stock_attention import _prefill_attention, _prefill_workload
 
 
@@ -76,6 +78,25 @@ class SGLangSourceOverlayTest(unittest.TestCase):
         self.assertIn("--unshare-pid", command)
         self.assertEqual(command[command.index(str(private)) - 1], "--tmpfs")
         self.assertEqual(Path(env["TRITON_CACHE_DIR"]), runtime / "cache" / "triton")
+
+    def test_dedicated_account_has_private_output_and_no_provider_key_or_extra_groups(self):
+        with (patch("hyperloop.backends.sglang_overlay.os.geteuid", return_value=0, create=True),
+              patch("hyperloop.backends.sglang_overlay.os.chown", create=True) as chown):
+            command, env, cwd = dedicated_launch(["python"], {"DEEPSEEK_API_KEY": "test-value"}, self.workspace,
+                                                  None, 61000, 1000)
+        self.assertIn("--clear-groups", command)
+        self.assertIn("--no-new-privs", command)
+        self.assertEqual(command[-2:], ["--", "python"])
+        self.assertNotIn("DEEPSEEK_API_KEY", env)
+        self.assertEqual(Path(env["TMPDIR"]), cwd / "tmp")
+        chown.assert_any_call(cwd, 61000, 1000)
+
+    def test_dedicated_account_may_not_replace_protected_paths_via_shared_group_parent(self):
+        guarded = SimpleNamespace(st_mode=0o755, st_uid=0, st_gid=0)
+        shared = SimpleNamespace(st_mode=0o775, st_uid=1000, st_gid=1000)
+        with patch.object(Path, "stat", lambda path: shared if path == self.original else guarded):
+            with self.assertRaisesRegex(BackendError, "can modify protected path"):
+                protected_paths([self.module], 61000, 1000)
 
 
 class StockAttentionDiagnosticTest(unittest.TestCase):

@@ -10,6 +10,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 from typing import Any
 
 from .runtime import BackendError, Record
@@ -170,16 +171,26 @@ def sandbox_launch(
     except OSError as error:
         raise BackendError(f"could not create writable candidate runtime directory: {error}") from error
 
+    child_env = _runtime_environment(environment, runtime, source, "/tmp")
+    return [str(sandbox), "--unshare-user", "--unshare-pid", "--cap-drop", "ALL", "--die-with-parent", "--ro-bind", "/", "/",
+            "--dev-bind", "/dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", *_private_mounts(environment, runtime),
+            "--bind", str(runtime), str(runtime), "--chdir", str(runtime), "--", *command], child_env, runtime
+
+
+def _runtime_environment(
+    environment: Mapping[str, str], runtime: Path, source: Mapping[str, Any] | None, temp: str,
+) -> dict[str, str]:
     allowed = {"PATH", "LD_LIBRARY_PATH", "LD_PRELOAD", "LANG", "LC_ALL", "TZ", "HF_HUB_OFFLINE",
                "TRANSFORMERS_OFFLINE", "TOKENIZERS_PARALLELISM", "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED"}
     prefixes = ("ASCEND_", "ATB_", "HCCL_", "OMP_", "MKL_", "LC_", "TRITON_", "TORCH_", "NPU_")
     child_env = {name: value for name, value in environment.items()
                  if name in allowed or name.startswith(prefixes) and not re.search(r"KEY|TOKEN|SECRET", name)}
     cache = runtime / "cache"
-    child_env.update({"HOME": str(runtime), "TMPDIR": "/tmp", "XDG_CACHE_HOME": str(cache),
+    child_env.update({"HOME": str(runtime), "TMPDIR": temp, "XDG_CACHE_HOME": str(cache),
                       "TRITON_HOME": str(runtime), "TRITON_CACHE_DIR": str(cache / "triton"),
                       "TRITON_OVERRIDE_DIR": str(cache / "triton-override"), "TRITON_DUMP_DIR": str(cache / "triton-dump"),
-                      "TORCHINDUCTOR_CACHE_DIR": str(cache / "torchinductor"), "PYTHONNOUSERSITE": "1"})
+                      "TORCHINDUCTOR_CACHE_DIR": str(cache / "torchinductor"), "PYTHONNOUSERSITE": "1",
+                      "ASCEND_PROCESS_LOG_PATH": str(runtime / "cann-log"), "ASCEND_WORK_PATH": str(runtime / "cann-work")})
     locations = [source["package_parent"]] if source is not None else []
     if original := environment.get("PYTHONPATH"):
         locations.append(original)
@@ -188,10 +199,46 @@ def sandbox_launch(
     if source is not None:
         child_env["HYPERLOOP_SGLANG_SOURCE_FILES"] = json.dumps(
             {file["staged_path"]: file["expected_sha256"] for file in source["files"]})
-    return [str(sandbox), "--unshare-user", "--unshare-pid", "--cap-drop", "ALL", "--die-with-parent", "--ro-bind", "/", "/",
-            "--dev-bind", "/dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", *_private_mounts(environment, runtime),
-            "--bind", str(runtime),
-            str(runtime), "--chdir", str(runtime), "--", *command], child_env, runtime
+    return child_env
+
+
+def protected_paths(paths: Collection[Path], uid: int, gid: int) -> None:
+    """Reject paths the dedicated process can edit, replace, or redirect."""
+    checked: set[Path] = set()
+    try:
+        for path in paths:
+            for root in (path.absolute(), path.resolve(strict=True)):
+                for part in (root, *root.parents):
+                    if part in checked:
+                        continue
+                    checked.add(part)
+                    info = part.stat()
+                    if (info.st_mode & stat.S_IWOTH
+                            or info.st_gid == gid and info.st_mode & stat.S_IWGRP
+                            or info.st_uid == uid and info.st_mode & stat.S_IWUSR):
+                        raise BackendError(f"dedicated SGLang account can modify protected path: {part}")
+    except OSError as error:
+        raise BackendError(f"could not check dedicated SGLang account protections: {error}") from error
+
+
+def dedicated_launch(
+    command: list[str], environment: Mapping[str, str], workspace: Path, source: Mapping[str, Any] | None,
+    uid: int, gid: int,
+) -> tuple[list[str], dict[str, str], Path]:
+    """Launch from a trusted root evaluator as a dedicated unprivileged account."""
+    if os.geteuid() != 0:
+        raise BackendError("the dedicated SGLang account requires a trusted root evaluator")
+    runtime = workspace / "runtime"
+    try:
+        runtime.mkdir(mode=0o750, exist_ok=False)
+        os.chown(runtime, uid, gid)
+        (runtime / "tmp").mkdir(mode=0o700)
+        os.chown(runtime / "tmp", uid, gid)
+    except OSError as error:
+        raise BackendError(f"could not create the dedicated account's runtime directory: {error}") from error
+    child_env = _runtime_environment(environment, runtime, source, str(runtime / "tmp"))
+    return ["/usr/bin/setpriv", f"--reuid={uid}", f"--regid={gid}", "--clear-groups", "--no-new-privs",
+            "--inh-caps=-all", "--ambient-caps=-all", "--bounding-set=-all", "--", *command], child_env, runtime
 
 
 def loaded_sources(log: Path, source: Mapping[str, Any]) -> list[Record]:

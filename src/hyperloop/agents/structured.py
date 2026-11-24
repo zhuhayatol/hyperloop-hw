@@ -103,8 +103,12 @@ def _profile(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         return {}
     hotspots = []
-    for row in sorted(raw.get("hotspots", []), key=lambda item: item.get("duration_us", 0), reverse=True)[:8]:
-        fields = {**_safe_labels(row, ("name", "dtype")), **_selected_numbers(row, ("rank", "duration_us", "events"))}
+    ordered = sorted(raw.get("hotspots", []),
+                     key=lambda item: (item.get("event_kind") != "device_runtime", item.get("duration_us", 0)),
+                     reverse=True)
+    for row in ordered[:8]:
+        fields = {**_safe_labels(row, ("name", "dtype", "phase", "event_kind", "operator")),
+                  **_selected_numbers(row, ("rank", "duration_us", "events"))}
         callsite = row.get("callsite", "")
         if isinstance(callsite, str):
             # Absolute prefixes belong to the local runtime. Task-relative package location is enough.

@@ -22,7 +22,7 @@ from urllib.request import ProxyHandler, build_opener
 from uuid import uuid4
 
 from .runtime import BackendError, Record, fingerprint
-from .sglang_overlay import loaded_sources, sandbox_launch, source_edit, source_path, stage_overlay
+from .sglang_overlay import dedicated_launch, loaded_sources, protected_paths, sandbox_launch, source_edit, source_path, stage_overlay
 
 
 _HOST = "127.0.0.1"
@@ -99,11 +99,11 @@ def _write_lease(workspace: Path, lease: Record) -> None:
     temporary.replace(workspace / _LEASE)
 
 
-def _lease_processes(nonce: str) -> dict[int, _Process]:
+def _lease_processes(lease: Mapping[str, Any]) -> dict[int, _Process]:
     """Use a unique inherited launch marker so recovery cannot stop another service."""
     owned: dict[int, _Process] = {}
-    marker = f"{_LEASE_ENV}={nonce}".encode()
-    uid = os.getuid()
+    marker = f"{_LEASE_ENV}={lease['nonce']}".encode()
+    uid = lease.get("run_uid", os.getuid())
     for entry in Path("/proc").iterdir():
         if not entry.name.isdecimal():
             continue
@@ -152,7 +152,7 @@ def _signal_owned(processes: Mapping[int, _Process], sig: signal.Signals) -> lis
 def _wait_lease(lease: Mapping[str, Any], timeout: float) -> list[int]:
     deadline = time.monotonic() + timeout
     while True:
-        remaining = sorted(set(_lease_processes(lease["nonce"])) | set(_live_group(lease)))
+        remaining = sorted(set(_lease_processes(lease)) | set(_live_group(lease)))
         if not remaining or time.monotonic() >= deadline:
             return remaining
         time.sleep(0.25)
@@ -168,7 +168,9 @@ def _stop_lease(lease: Mapping[str, Any]) -> Record:
                                 ("forced_wait", signal.SIGKILL, 25)):
         if not remaining:
             break
-        owned = _lease_processes(lease["nonce"])
+        owned = _lease_processes(lease)
+        if "run_uid" in lease:
+            owned = {pid: identity for pid, identity in owned.items() if identity.session == leader}
         if phase == "launcher_grace":
             identity = owned.get(leader)
             if (identity is None or identity.start_ticks != lease.get("start_ticks")
@@ -251,8 +253,18 @@ class SGLangBackend:
         if not isinstance(allowed_paths, list):
             raise BackendError("target.sglang.allowed_source_paths must be a list of exact SGLang files")
         self._allowed_source = frozenset(source_path(path) for path in allowed_paths)
+        trial_user = config.get("source_trial_user")
+        self._trial_user = None
+        if trial_user is not None:
+            if (not isinstance(trial_user, Mapping) or trial_user.keys() != {"uid", "gid"}
+                    or any(type(value) is not int or value < 1 for value in trial_user.values())
+                    or config.get("source_sandbox") is not None):
+                raise BackendError("target.sglang.source_trial_user requires positive uid and gid without source_sandbox")
+            if sys.platform != "linux" or os.geteuid() != 0 or not Path("/usr/bin/setpriv").is_file():
+                raise BackendError("the dedicated SGLang account requires Linux, setpriv and a trusted root evaluator")
+            self._trial_user = (trial_user["uid"], trial_user["gid"])
         self._source_sandbox = None
-        if self._allowed_source:
+        if self._allowed_source and self._trial_user is None:
             sandbox = _local_path(config, "source_sandbox").resolve()
             if not sandbox.is_file() or not os.access(sandbox, os.X_OK):
                 raise BackendError("target.sglang.source_sandbox must name the executable bubblewrap program")
@@ -287,6 +299,8 @@ class SGLangBackend:
 
     def bind_session(self, path: Path) -> None:
         self._session = path.resolve()
+        if self._trial_user is not None:
+            protected_paths([self._session], *self._trial_user)
 
     def _run(self, argv: list[str], timeout: float) -> str:
         try:
@@ -336,6 +350,10 @@ class SGLangBackend:
     def probe(self) -> Record:
         if sys.platform != "linux":
             raise BackendError("the real SGLang runtime requires Linux")
+        if self._trial_user is not None:
+            sources = [self._source / path for path in self._allowed_source]
+            protected_paths([self._python, self._source, self._model, self._tokenizer, Path(__file__), *sources],
+                            *self._trial_user)
         try:
             prefix = "HYPERLOOP_NPU_PROBE="
             lines = self._run([str(self._python), "-c", _PROBE], 90).splitlines()
@@ -366,6 +384,9 @@ class SGLangBackend:
                 raise BackendError("SGLang model directory must include config.json and safetensors weights")
             if not any(name in tokenizer_files for name in ("tokenizer.json", "tokenizer.model", "vocab.json")):
                 raise BackendError("SGLang tokenizer directory has no recognized vocabulary file")
+            if self._trial_user is not None:
+                locked_files = [self._model / name for name in model_files] + [self._tokenizer / name for name in tokenizer_files]
+                protected_paths(locked_files, *self._trial_user)
             environment = {
                 "mode": "real", "target_id": self._target["id"], "devices": ["0"], "tp_size": 1,
                 "rank_map": {"0": "0"}, "software": software, "device_name": device_name,
@@ -379,6 +400,10 @@ class SGLangBackend:
                 environment["source_integration"] = {"allowed_paths": sorted(self._allowed_source),
                                                      "sandbox": str(self._source_sandbox),
                                                      "sandbox_sha256": self._file_hash(self._source_sandbox)}
+            if self._trial_user is not None:
+                uid, gid = self._trial_user
+                environment["source_integration"] = {"allowed_paths": sorted(self._allowed_source),
+                                                     "dedicated_run_uid": uid, "dedicated_run_gid": gid}
             if self._ascend_use_fia is not None:
                 environment["stock_attention_control"] = {"ASCEND_USE_FIA": self._ascend_use_fia, "ASCEND_USE_FA": False}
         except (OSError, KeyError, IndexError, ValueError, TypeError) as error:
@@ -399,7 +424,7 @@ class SGLangBackend:
         for change in stack["framework"]:
             if change["kind"] == "patch":
                 source_edit(change, self._allowed_source)
-                if self._source_sandbox is None:
+                if self._source_sandbox is None and self._trial_user is None:
                     raise BackendError("SGLang source candidates require an isolated runtime")
             elif change["kind"] != "parameters":
                 raise BackendError(f"unsupported SGLang framework change: {change['kind']}")
@@ -492,14 +517,20 @@ class SGLangBackend:
             env = {**env, **stock_control}
         if self._source_sandbox is not None:
             command, env, cwd = sandbox_launch(command, env, self._source_sandbox, workspace, source)
+        if self._trial_user is not None:
+            protected_paths([workspace], *self._trial_user)
+            command, env, cwd = dedicated_launch(command, env, workspace, source, *self._trial_user)
         lease = {"nonce": nonce, "state": "launching", "pid": None, "port": port,
                  "revision": revision, "launch_command": command}
+        if self._trial_user is not None:
+            lease["run_uid"] = self._trial_user[0]
         try:
             _write_lease(workspace, lease)
             with log.open("xb") as stdout:
                 self._child = subprocess.Popen(command, env={**env, _LEASE_ENV: nonce}, cwd=cwd,
                                                stdout=stdout, stderr=subprocess.STDOUT,
-                                               stdin=subprocess.DEVNULL, start_new_session=True)
+                                               stdin=subprocess.DEVNULL, start_new_session=True,
+                                               umask=0o027 if self._trial_user is not None else -1)
             lease["pid"] = self._child.pid
             if (identity := _process(self._child.pid)) is not None:
                 lease["start_ticks"] = identity.start_ticks
@@ -522,7 +553,7 @@ class SGLangBackend:
             "workspace": str(workspace), "ready": True, "candidate_hit": True, "base_url": base_url,
             "pid": self._child.pid, "launch_command": command, "server_log": str(log), "server_info": loaded,
         }
-        if self._source_sandbox is not None:
+        if self._source_sandbox is not None or self._trial_user is not None:
             self._active["writable_runtime"] = str(cwd)
         if source:
             self._active["source_overlay"] = {**source, "loaded_files": observed}
@@ -562,15 +593,17 @@ class SGLangBackend:
             raise BackendError("real SGLang NPU profile is disabled for this target")
         identity = self._observation(instance, workload)
         workspace = Path(instance["workspace"]).resolve()
-        writable = Path(instance.get("writable_runtime", workspace)).resolve()
+        writable = (workspace if self._trial_user is not None
+                    else Path(instance.get("writable_runtime", workspace)).resolve())
         if not writable.is_relative_to(workspace):
             raise BackendError("SGLang profile output must stay inside the owned workspace")
-        software = self.probe()["environment"]["software"]
+        software = (self._probe or self.probe())["environment"]["software"]
         output = collect_profile(
             instance["base_url"], workload, revision=instance["revision"],
             tool_version=f"SGLang {software['sglang']} / Torch NPU {software['torch_npu']}",
             directory=writable / "profile", evidence_root=self._session or workspace,
             request_timeout=self._request_timeout, export_timeout=self._profile_export_timeout,
+            output_owner=self._trial_user,
         )
         self._observation(instance, workload)
         return {**output, **identity}
@@ -590,6 +623,8 @@ class SGLangBackend:
             nonce = lease["nonce"]
             if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
                 raise ValueError("invalid lease marker")
+            if lease.get("run_uid") != (self._trial_user[0] if self._trial_user is not None else None):
+                raise ValueError("SGLang lease user differs from the locked trial user")
             result = _stop_lease(lease)
             if result["released"]:
                 lease["state"] = "released"

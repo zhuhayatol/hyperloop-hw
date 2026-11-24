@@ -513,22 +513,13 @@ def _validation_section(summary: dict[str, Any]) -> str:
     return "".join(tasks) or "<p>尚无验证任务。</p>"
 
 
-def _agent_candidates(params: Any) -> list[Mapping[str, Any]]:
-    fields = _mapping(params)
-    return [*_records(fields.get("candidates")), *_records([fields.get("candidate")])]
-
-
 def _agent_call_rows(raw_events: list[Mapping[str, Any]], state: Mapping[str, Any], read_evidence) -> list[dict]:
-    proposals: dict[str, Mapping[str, Any]] = {}
-    routed_tasks: dict[str, list[str]] = {}
+    routes: dict[str, list[Mapping[str, Any]]] = {}
     for event in raw_events:
-        data = _mapping(event.get("payload"))
-        if event.get("type") == "proposal_registered" and isinstance(data.get("proposal_id"), str):
-            proposals[data["proposal_id"]] = data
         if event.get("type") == "intent_result":
-            task_id = _mapping(data.get("result")).get("task_id")
-            if isinstance(data.get("turn_id"), str) and isinstance(task_id, str):
-                routed_tasks.setdefault(data["turn_id"], []).append(task_id)
+            data = _mapping(event.get("payload"))
+            if isinstance(data.get("turn_id"), str):
+                routes.setdefault(data["turn_id"], []).append(_mapping(data.get("result")))
 
     result = []
     for event in raw_events:
@@ -537,18 +528,14 @@ def _agent_call_rows(raw_events: list[Mapping[str, Any]], state: Mapping[str, An
         data = _mapping(event.get("payload"))
         proof = read_evidence(_mapping(data.get("evidence"))) or {}
         intents = _records(proof.get("normalized_intents"))
-        candidates = set()
-        for intent in intents:
-            proposal_id = intent.get("proposal_id")
-            origin = proposals.get(proposal_id, {}) if isinstance(proposal_id, str) else {}
-            specs = _agent_candidates(intent.get("params")) + _agent_candidates(origin.get("params"))
-            candidates.update(spec["id"] for spec in specs if isinstance(spec.get("id"), str))
-        tasks = routed_tasks.get(data.get("turn_id"), [])
+        routed = routes.get(data.get("turn_id"), [])
+        tasks = {row["task_id"] for row in routed if isinstance(row.get("task_id"), str)}
+        proposals = {row["proposal_id"] for row in routed if isinstance(row.get("proposal_id"), str)}
         decisions = [
             {**{key: row[key] for key in ("candidate_id", "version_action", "reason") if key in row},
              "anchor": f"candidate-outcome-{index}"}
             for index, row in enumerate(_records(state.get("decisions")), 1)
-            if row.get("candidate_id") in candidates or row.get("task_id") in tasks
+            if row.get("task_id") in tasks or row.get("proposal_id") in proposals
         ]
         preview = _pretty(intents) if "normalized_intents" in proof else None
         if preview and len(preview) > 1200:

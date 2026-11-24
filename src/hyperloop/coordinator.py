@@ -433,7 +433,7 @@ class Coordinator:
                 {**call, **metadata, "normalized_intents": intents}, producer="agent_provider",
             )
             self._emit("agent_provider_call", {
-                **{key: value for key, value in call.items() if key != "request_context"},
+                **{key: value for key, value in call.items() if key not in {"request_context", "response_content"}},
                 **metadata, "evidence": evidence,
             })
             if call["status"] == "failed":

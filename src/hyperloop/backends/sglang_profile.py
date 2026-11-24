@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import re
 from time import monotonic, sleep
@@ -165,10 +166,12 @@ def _profile_api(base_url: str, endpoint: str, timeout: float, body: Record | No
 
 def _profile_phase(
     base_url: str, workload: Mapping[str, Any], phase: str, requests: list[Record], directory: Path,
-    *, evidence_root: Path, request_timeout: float, export_timeout: float,
+    *, evidence_root: Path, request_timeout: float, export_timeout: float, output_owner: tuple[int, int] | None,
 ) -> tuple[list[Record], Record]:
     try:
-        directory.mkdir(parents=True, exist_ok=False)
+        directory.mkdir(parents=True, mode=0o750 if output_owner else 0o777, exist_ok=False)
+        if output_owner is not None:
+            os.chown(directory, *output_owner)
     except OSError as error:
         raise BackendError(f"Could not create the owned {phase} profile directory: {error}") from error
     # Warm the service once for this shape and remove any radix-cache prefix before capture.
@@ -202,7 +205,7 @@ def _profile_phase(
 
 def collect_profile(
     base_url: str, workload: Mapping[str, Any], *, revision: str, tool_version: str, directory: Path,
-    evidence_root: Path, request_timeout: float, export_timeout: float,
+    evidence_root: Path, request_timeout: float, export_timeout: float, output_owner: tuple[int, int] | None = None,
 ) -> Record:
     """Export one distinct rank-zero trace per frozen request group, outside performance timing."""
     grouped: dict[str, list[Record]] = {phase: [] for phase in _PHASES}
@@ -218,7 +221,7 @@ def collect_profile(
             continue
         rows, capture = _profile_phase(base_url, workload, phase, cases, directory / phase,
                                        evidence_root=evidence_root, request_timeout=request_timeout,
-                                       export_timeout=export_timeout)
+                                       export_timeout=export_timeout, output_owner=output_owner)
         phases.append(capture)
         events.extend(rows)
     if not phases:
