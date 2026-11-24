@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -22,6 +23,10 @@ _EXECUTORS = {
     "kernel_agent": "算子执行流程", "conc_sweep": "SWEEP", "stack_revalidate": "整栈补测",
 }
 _ROLES = {"orchestration": "Orchestration", "specialist": "Specialist", "critic": "Critic"}
+_NATIVE_DELIVERIES = {
+    "native_geak": ("geak", "service_candidate", "昇腾 GEAK"),
+    "native_forge": ("forge", "operator_patch", "昇腾 Forge"),
+}
 
 
 def _record(value: Any) -> Record:
@@ -43,6 +48,51 @@ def _edge(
     if isinstance(evidence, Mapping) and isinstance(evidence.get("path"), str):
         row["evidence"] = [dict(evidence)]
     return row
+
+
+def read_native_delivery(reference: Record, reader: ReadEvidence) -> Record | None:
+    producer = reference.get("producer")
+    route = _NATIVE_DELIVERIES.get(producer) if isinstance(producer, str) else None
+    if not route or not re.fullmatch(r"evidence/kernel/[A-Za-z0-9][A-Za-z0-9_.-]*-delivery\.json",
+                                    str(reference.get("path", ""))):
+        return None
+    delivery = reader(reference)
+    if delivery and (delivery.get("mode"), delivery.get("backend"), delivery.get("delivery")) == ("real", *route[:2]):
+        return delivery
+    return None
+
+
+def native_geak_trials(delivery: Record) -> list[tuple[Record, str]]:
+    if delivery.get("backend") != "geak":
+        return []
+    parent = _record(delivery.get("parent_trial"))
+    candidate = _record(delivery.get("candidate_trial"))
+    return [(trial, label) for trial, label in (
+        (parent, "昇腾 GEAK · 父版服务试跑"),
+        (candidate, "昇腾 GEAK · 候选服务试跑"),
+        (_record(candidate.get("activation")), "昇腾 GEAK · Attention 调用证明"),
+    ) if trial]
+
+
+def _forge_worker_attempt(task_id: str, delivery: Record, reference: Record) -> Record | None:
+    evidence = _record(delivery.get("evidence"))
+    process = _record(evidence.get("worker_process"))
+    if not process:
+        return None
+    operator = _record(evidence.get("operator"))
+    steps = [_edge("昇腾 Forge", "Triton-Ascend Worker", "SwiGLU 算子源码和固定输入规格",
+                   "隔离编译，校验 CPU 参考输出并记录 NPU 计时", status="requested", evidence=reference)]
+    if operator.get("status") == "complete":
+        reply = f"编译产物、正确性结果和 {len(_rows(operator.get('cases')))} 组设备计时"
+        operation = "读取原始样本并核对编译产物摘要、样本和中位数"
+    else:
+        reply = f"Worker 执行回执 · 退出码 {process.get('exit_code', '未记录')}"
+        operation = f"记录算子试验终态 · {delivery.get('reason', '')}"
+    steps.append(_edge("Triton-Ascend Worker", "昇腾 Forge", reply, operation,
+                       status="succeeded" if delivery.get("status") == "ok" else "failed", evidence=reference))
+    return {"attempt_id": f"{task_id}-forge", "label": "昇腾 Forge · 单算子执行", "origin": "reconstructed",
+            "steps": steps, "after": [], "candidate_id": _record(delivery.get("candidate")).get("id"),
+            "status": delivery.get("status"), "trace": None}
 
 
 def _run_graph(run: Record, label: str, reader: ReadEvidence) -> Record | None:
@@ -107,7 +157,10 @@ def _run_graph(run: Record, label: str, reader: ReadEvidence) -> Record | None:
     }
 
 
-def _attempts(result: Record, action: str, reader: ReadEvidence) -> list[Record]:
+def _attempts(
+    result: Record, action: str, reader: ReadEvidence, native_worker: Record | None,
+    native_delivery: Record | None,
+) -> tuple[list[Record], Record | None]:
     attempts: list[Record] = []
     seen: set[str] = set()
 
@@ -125,6 +178,16 @@ def _attempts(result: Record, action: str, reader: ReadEvidence) -> list[Record]
     forward = _record(result.get("model_forward"))
     if forward:
         add(forward, "原始版本模型 forward")
+    native_tail = None
+    if native_delivery:
+        for trial, label in native_geak_trials(native_delivery):
+            attempt = add(trial, label)
+            if attempt:
+                _record_geak_trial_handoffs(attempt, trial)
+                native_tail = attempt
+    if native_worker:
+        attempts.append(native_worker)
+        native_tail = native_worker
     for row in _rows(result.get("decisions")):
         candidate = str(row.get("candidate_id") or "候选")
         tool = _record(row.get("tool_evidence"))
@@ -158,7 +221,26 @@ def _attempts(result: Record, action: str, reader: ReadEvidence) -> list[Record]
                         "BenchmarkRunner", "SWEEP", f"并发 {concurrency} · 原始版与接受版的样本",
                         "对齐这一个工作点并保存两组指标的比较", evidence=_record(result.get("evidence")).get("paired_sweep"),
                     ))
-    return attempts
+    return attempts, native_tail
+
+
+def _record_geak_trial_handoffs(attempt: Record, trial: Record) -> None:
+    evidence = _record(trial.get("evidence"))
+    operator = trial.get("expected_operator")
+    if operator:
+        request = f"{trial['revision']} · 采集 {operator} 的实际调用"
+        reply = "返回调用位置和 Profile 证据"
+        result = evidence.get("profile_analysis")
+    else:
+        launch = _record(trial.get("launch_control"))
+        request = f"{trial['revision']} · ASCEND_USE_FIA={launch.get('ASCEND_USE_FIA', '未确认')}"
+        reply = "返回模型输出校验和端到端样本"
+        result = evidence.get("revision_measurement")
+    attempt["steps"].insert(0, _edge("昇腾 GEAK", "Evaluator", request,
+                                     "按冻结的服务负载执行隔离验证", status="requested", evidence=attempt["trace"]))
+    attempt["after"].append(_edge("Evaluator", "昇腾 GEAK", reply if result else "返回试验受阻回执",
+                                  "保存工具侧试验的结果和原始证据", status="recorded" if result else "failed",
+                                  evidence=result or evidence.get("decision")))
 
 
 def build_validation_graphs(state: Record, events: list[Record], reader: ReadEvidence) -> list[Record]:
@@ -240,7 +322,11 @@ def _task_graph(
         run = {**result, "decisions": group["runs"] or result.get("decisions", [])}
     else:
         run = group["runs"][-1] if group["runs"] else result
-    attempts = _attempts(run, action, reader)
+    evidence = _record(run.get("evidence"))
+    delivery_ref = _record(evidence.get("delivery"))
+    delivery = read_native_delivery(delivery_ref, reader) if action == "kernel_agent" else None
+    worker = _forge_worker_attempt(task_id, delivery, delivery_ref) if delivery and delivery["backend"] == "forge" else None
+    attempts, native_tail = _attempts(run, action, reader, worker, delivery)
 
     first = _submission_edges(proposal_events, delegation, action)
     last: list[Record] = []
@@ -251,6 +337,17 @@ def _task_graph(
     if "task_started" in events:
         first.append(_edge("Dispatcher", executor, f"{task_id} · {action}", "取得资源后由 Coordinator 启动该验证任务",
                            event=events["task_started"]))
+    if delivery:
+        tool = _NATIVE_DELIVERIES[delivery_ref["producer"]][2]
+        first.append(_edge(executor, tool, "当前版本、固定负载和热点证据",
+                           "按会话指定路线提交算子优化任务", status="requested", evidence=evidence.get("handoff")))
+        status = delivery.get("status", "blocked")
+        message = ("服务候选及工具测量" if delivery["backend"] == "geak" else "算子补丁及设备测量")
+        if status != "ok":
+            message = "工具阻断回执" if status == "blocked" else "工具失败回执"
+        publication = _edge(tool, executor, message, f"{status} · {delivery.get('reason', '')}",
+                            status="succeeded" if status == "ok" else status, evidence=delivery_ref)
+        (native_tail["after"] if native_tail else first).append(publication)
     if receipt_ref:
         last.append(_edge(executor, "Coordinator", "任务回执", "保存执行结果、尝试编号和证据引用",
                           evidence=receipt_ref, event=result_event))

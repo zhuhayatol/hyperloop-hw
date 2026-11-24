@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from hyperloop.backends.runtime import BackendError
+from hyperloop.backends.sglang import SGLangBackend
 from hyperloop.backends.sglang_overlay import dedicated_launch, loaded_sources, protected_paths, sandbox_launch, source_edit, stage_overlay
 from scripts.diagnose_ascend_stock_attention import _prefill_attention, _prefill_workload
 
@@ -67,6 +68,31 @@ class SGLangSourceOverlayTest(unittest.TestCase):
         log.write_text("service ready\n", encoding="utf-8")
         with self.assertRaisesRegex(BackendError, "no activation evidence"):
             loaded_sources(log, overlay)
+
+    def test_native_operator_call_requires_post_startup_workload_and_owned_process(self):
+        marker = "HYPERLOOP_FORGE_SWIGLU_INVOKED_0123456789ab"
+        record = f"{marker} pid=42 tokens=2 width=9728 kernel=_hyperloop_forge_swiglu_aiv hash={'c' * 64}\n"
+        unrelated = record.replace("pid=42", "pid=99")
+        log = self.workspace / "server.log"
+        log.write_bytes((record + unrelated).encode())
+        (self.workspace / "sglang-lease.json").write_text("{}", encoding="utf-8")
+        staged = str(self.workspace / self.patch_path)
+        instance = {
+            "workspace": str(self.workspace), "server_log": str(log), "kernel_log_offset": len(record.encode()),
+            "loaded_stack": {"kernels": [{"candidate_id": "forge-1", "invocation_marker": marker,
+                                          "patch_path": self.patch_path}]},
+            "source_overlay": {"files": [{"path": self.patch_path, "staged_path": staged}],
+                               "loaded_files": [{"path": staged, "sha256": "b" * 64}]},
+        }
+        backend = object.__new__(SGLangBackend)
+        with patch("hyperloop.backends.sglang._lease_processes", return_value={42: object()}):
+            with self.assertRaisesRegex(BackendError, "did not invoke"):
+                backend._kernel_activation(instance)
+            with log.open("ab") as stream:
+                stream.write(record.encode())
+            activated = backend._kernel_activation(instance)
+        self.assertEqual((activated["candidate_id"], activated["pid"], activated["source_sha256"]),
+                         ("forge-1", "42", "b" * 64))
 
     def test_sandbox_masks_private_config_and_keeps_compile_caches_in_the_trial(self):
         home = self.root / "home"

@@ -304,7 +304,8 @@ class RuntimeActions:
         operator = "fusedinferattentionscore" if use_fia else "flashattention"
         matches = [
             hit for hit in profile.get("hotspots", [])
-            if operator in hit.get("name", "").casefold()
+            if hit.get("phase") == "prefill" and hit.get("event_kind") == "kernel"
+            and operator in hit.get("name", "").casefold()
             and hit.get("callsite", "").startswith("sglang/srt/hardware_backend/npu/attention/ascend_backend.py:")
         ]
         measured["activation"] = {

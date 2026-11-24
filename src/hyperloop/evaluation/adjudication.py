@@ -347,6 +347,15 @@ def _review(
     base_context = _context(baseline_proof, manifest, rules, {"verify", "benchmark"}, reference)
     base_instance = _instance(baseline_proof, base_context, baseline.get("revision"), "revision", "framework")
     parent_instance = _instance(proof, context, parent_revision, "parent", "framework")
+    geak = manifest.get("target", {}).get("sglang", {})
+    if manifest["mode"] == "real" and decision.get("backend") == "geak" and geak.get("native_geak") is True:
+        parent_fia = parent_revision["parameters"].get("ascend_use_fia", geak.get("ascend_use_fia"))
+        candidate_fia = revision["parameters"].get("ascend_use_fia")
+        if type(parent_fia) is not bool or type(candidate_fia) is not bool or candidate_fia == parent_fia or any(
+            arm.get("stock_attention_launch_control") != {"ASCEND_USE_FIA": "1" if enabled else "0", "ASCEND_USE_FA": "0"}
+            for arm, enabled in ((instance, candidate_fia), (parent_instance, parent_fia))
+        ):
+            raise EvidenceProblem("native_geak_attention_setting_mismatch", "incomparable", "blocked")
     if len({item["instance_id"] for item in (instance, parent_instance, base_instance)}) != 3:
         raise EvidenceProblem("adjudication_measurement_instances_overlap")
     if not _verify(proof, context, parent_instance, rules, reference, "parent")["pass"]:

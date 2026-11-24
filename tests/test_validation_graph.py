@@ -2,6 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
+from hyperloop.evaluation.evidence import AttemptEvidence
 from hyperloop.report import write_report
 from hyperloop.session import SessionStore
 
@@ -72,6 +73,75 @@ class ValidationGraphTests(unittest.TestCase):
         self.assertTrue(all(row["evidence"] for row in attempt["steps"]))
         self.assertFalse(sweep["attempts"])
         self.assertEqual(sweep["last"][0]["state"], "skipped")
+
+    def test_native_geak_delivery_links_tool_trials_before_independent_validation(self) -> None:
+        self.store = SessionStore.create(self.store.path.parents[1], "real", "native-geak", {})
+
+        def trial(attempt_id, revision, raw_key):
+            evidence = AttemptEvidence(self.store.path, attempt_id)
+            evidence.save(raw_key, {"revision": revision}, "evaluation")
+            evidence.save("validation_flow", {"schema_version": 1, "attempt_id": attempt_id, "steps": [{
+                "sender": "RuntimeBackend", "receiver": "Evaluator", "message": "返回实际样本",
+                "operation": "read", "state": "succeeded", "evidence_keys": [raw_key],
+            }]}, "evaluation_trace")
+            return {"attempt_id": attempt_id, "revision": revision, "status": "ok", "evidence": evidence.records}
+
+        parent = trial("task-0001-geak-parent", "base", "revision_measurement")
+        parent["launch_control"] = {"ASCEND_USE_FIA": "0"}
+        candidate = trial("task-0001-geak-candidate", "candidate", "revision_measurement")
+        candidate["launch_control"] = {"ASCEND_USE_FIA": "1"}
+        candidate["activation"] = {**trial("task-0001-geak-candidate-activation", "candidate", "profile_analysis"),
+                                   "expected_operator": "fusedinferattentionscore"}
+        independent = trial("task-0001-independent", "candidate", "candidate_measurement")
+        self._record_native_delivery("geak", "service_candidate", {
+            "status": "ok", "reason": "service_candidate_ready_for_review",
+            "parent_trial": parent, "candidate_trial": candidate,
+        }, decisions=[{**independent, "candidate_id": "candidate"}])
+
+        graph, = self.report()["validation_graphs"]
+        self.assertEqual([row["attempt_id"] for row in graph["attempts"]], [
+            "task-0001-geak-parent", "task-0001-geak-candidate", "task-0001-geak-candidate-activation",
+            "task-0001-independent",
+        ])
+        self.assertTrue(all(attempt["origin"] == "instrumented" for attempt in graph["attempts"]))
+        self.assertEqual(graph["first"][-1]["receiver"], "昇腾 GEAK")
+        self.assertEqual(graph["attempts"][1]["steps"][0]["message"], "candidate · ASCEND_USE_FIA=1")
+        self.assertEqual(graph["attempts"][2]["after"][-1]["message"], "服务候选及工具测量")
+        html = (self.store.path / "report.html").read_text("utf-8")
+        self.assertIn('href="evaluation/task-0001-geak-candidate-activation/profile_analysis.json"', html)
+
+    def test_native_forge_failure_renders_worker_and_publication_without_a_decision(self) -> None:
+        self.store = SessionStore.create(self.store.path.parents[1], "real", "native-forge", {})
+        self._record_native_delivery("forge", "operator_patch", {
+            "status": "failed", "reason": "forge_worker_timeout",
+            "evidence": {"worker_process": {"exit_code": -9, "timed_out": True, "process_group_clear": True}},
+        }, decisions=[])
+
+        graph, = self.report()["validation_graphs"]
+        worker, = graph["attempts"]
+        self.assertEqual(worker["steps"][0]["receiver"], "Triton-Ascend Worker")
+        self.assertEqual(worker["steps"][1]["state"], "failed")
+        self.assertIn("-9", worker["steps"][1]["message"])
+        self.assertEqual(worker["after"][0]["message"], "工具失败回执")
+        self.assertEqual(worker["after"][0]["receiver"], "算子执行流程")
+        self.assertTrue(worker["after"][0]["evidence"])
+
+    def _record_native_delivery(self, backend, delivery, result, *, decisions):
+        task = {"task_id": "task-0001", "action": "kernel_agent", "source": "coordinator"}
+        handoff = self.store.put_evidence("evidence/kernel/task-0001-handoff.json", {"backend": backend},
+                                          producer="kernel_handoff")
+        publication = self.store.put_evidence("evidence/kernel/task-0001-delivery.json", {
+            **result, "mode": "real", "backend": backend, "delivery": delivery,
+        }, producer=f"native_{backend}")
+        receipt = self.store.put_evidence("evidence/actions/task-0001.json", {
+            **task, "result": {"status": result["status"], "reason": result["reason"], "decisions": decisions,
+                               "evidence": {"handoff": handoff, "delivery": publication}},
+        }, producer="action_executor")
+        self.store.commit([
+            ("task_started", task),
+            ("task_settled", {**task, "result": {"receipt": receipt, "evidence": {"delivery": publication}}}),
+            *(("candidate_attempt", {**decision, "task_id": task["task_id"]}) for decision in decisions),
+        ])
 
     def test_detached_reproduction_appears_without_modifying_events(self) -> None:
         data = {"candidate_id": "R03", "status": "ok", "version_action": "REVERT",

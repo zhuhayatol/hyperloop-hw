@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 from .contracts import json_bytes
 from .session import atomic_write
-from .validation_graph import build_reproduction_graphs, build_validation_graphs
+from .validation_graph import build_reproduction_graphs, build_validation_graphs, native_geak_trials, read_native_delivery
 
 
 _STYLES = """
@@ -181,6 +181,26 @@ def _index_entries(root: Path, *values: Any) -> list[dict[str, Any]]:
             entry["href"] = quote(raw, safe="/") if state in {"available", "hash_mismatch"} else None
             entries[key] = entry
     return list(entries.values())
+
+
+def _index_native_trials(root: Path, entries: dict[tuple[str, str], dict[str, Any]]) -> None:
+    nested = []
+    for entry in entries.values():
+        delivery = read_native_delivery(entry, lambda reference: _read_graph_evidence(root, entries, reference))
+        for trial, _ in native_geak_trials(delivery or {}):
+            for reference in _mapping(trial.get("evidence")).values():
+                ref = _mapping(reference)
+                path = ref.get("path")
+                digest = ref.get("sha256")
+                if (not isinstance(path, str) or not isinstance(digest, str)
+                        or not re.fullmatch(r"evaluation/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\.json", path)
+                        or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+                    continue
+                local = root / path
+                if not any(part.is_symlink() for part in (local, local.parent, local.parent.parent)):
+                    nested.append(ref)
+    for entry in _index_entries(root, nested):
+        entries.setdefault(_reference_key(entry), entry)
 
 
 def _evidence_for(record: Mapping[str, Any], entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -726,6 +746,7 @@ def write_report(
     reproductions = _reproduction_receipts(root, manifest)
     evidence = _index_entries(root, index, state, raw_events, reproductions)
     entries = {_reference_key(ref): ref for ref in evidence}
+    _index_native_trials(root, entries)
 
     def read_graph_evidence(ref: Mapping[str, Any]) -> dict[str, Any] | None:
         return _read_graph_evidence(root, entries, ref)
@@ -746,7 +767,7 @@ def write_report(
         "sweeps": _records(state.get("sweeps")),
         "stack_validations": _records(state.get("stack_validations")),
         "timeline": timeline,
-        "evidence": evidence,
+        "evidence": list(entries.values()),
         "agent_calls": _agent_call_rows(raw_events, state, read_graph_evidence),
         "validation_graphs": build_validation_graphs(state, raw_events, read_graph_evidence)
         + build_reproduction_graphs(reproductions, read_graph_evidence),
