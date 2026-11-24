@@ -237,6 +237,8 @@ def dedicated_launch(
     except OSError as error:
         raise BackendError(f"could not create the dedicated account's runtime directory: {error}") from error
     child_env = _runtime_environment(environment, runtime, source, str(runtime / "tmp"))
+    trial_name = f"hyperloop-trial-{uid}"
+    child_env.update(USER=trial_name, LOGNAME=trial_name)
     require_unprivileged = """\
 import os
 import sys

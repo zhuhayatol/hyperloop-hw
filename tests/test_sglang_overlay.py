@@ -90,6 +90,7 @@ class SGLangSourceOverlayTest(unittest.TestCase):
         self.assertIn("NoNewPrivs", command[-2])
         self.assertEqual(command[-1], "python")
         self.assertNotIn("DEEPSEEK_API_KEY", env)
+        self.assertEqual(env["LOGNAME"], "hyperloop-trial-61000")
         self.assertEqual(Path(env["TMPDIR"]), cwd / "tmp")
         chown.assert_any_call(cwd, 61000, 1000)
 
