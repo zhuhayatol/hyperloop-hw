@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import patch
 
 from hyperloop.backends import SimulatedBackend
 from hyperloop.evaluation import Evaluator
@@ -98,6 +99,29 @@ class EvaluationTests(TestCase):
         raw = self.root / result["evidence"]["parent_repeat_1"]["path"]
         self.assertIsNone(json.loads(raw.read_text(encoding="utf-8")))
 
+    def test_missing_requests_short_output_and_profile_mixed_are_not_accepted(self):
+        baseline = self.baseline()
+        for fault, reason in (
+            ("short_output", "timing_tokens_mismatch"),
+            ("profile_mixed", "timing_boundary_mismatch"),
+        ):
+            with self.subTest(fault=fault):
+                self.backend.register_revision(fault, {"throughput": 500, "faults": [fault]})
+                result = self.evaluate(fault, "original", baseline)
+                self.assertEqual(result["version_action"], "HOLD")
+                self.assertEqual(result["reason"], reason)
+                self.assertIn("candidate_repeat_0", result["evidence"])
+
+        benchmark = self.backend.benchmark
+
+        def return_missing_requests(instance, workload, **kwargs):
+            return {**benchmark(instance, workload, **kwargs), "requests": []}
+
+        with patch.object(self.backend, "benchmark", side_effect=return_missing_requests):
+            result = self.evaluate("R01", "original", baseline)
+        self.assertEqual(result["reason"], "timing_requests_missing")
+        self.assertEqual(result["version_action"], "HOLD")
+
     def test_cleanup_failure_retains_raw_results_and_blocks_promotion(self):
         baseline = self.baseline()
         self.backend.register_revision("unsafe", {"throughput": 120, "faults": ["cleanup"]})
@@ -123,6 +147,10 @@ class EvaluationTests(TestCase):
         partial = evaluator.profile("R02", WORKLOAD, attempt_id="dual-partial")
         self.assertEqual(partial["status"], "partial")
         self.assertEqual(partial["missing_ranks"], [1])
+        backend.register_revision("R02", {"fault": "profile_wrong_revision"})
+        conflict = evaluator.profile("R02", WORKLOAD, attempt_id="dual-wrong-revision")
+        self.assertEqual(conflict["reason"], "profile_rank_revision_mismatch")
+        self.assertEqual(conflict["evidence_state"], "conflict")
 
     def test_baseline_from_other_target_does_not_promote(self):
         baseline = self.baseline()

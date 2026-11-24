@@ -145,3 +145,47 @@ class ReportTests(unittest.TestCase):
         self.assertIn("缺失 | 无法判定 | HOLD", markdown)
         self.assertEqual(summary["decisions"][0]["version_action"], "HOLD")
         self.assertIsNone(summary["current_revision"])
+
+    def test_timeline_compacts_checkpoints_and_keeps_committed_messages_and_evidence(self) -> None:
+        raw = self.session.put_evidence("evidence/checkpoint-only.json", {"ready": True}, producer="runner")
+        marker = "duplicate-checkpoint-state"
+        large_result = marker * 10_000
+        task = {"task_id": "T1", "result": large_result, "reference": raw}
+        checkpoint = {
+            "tasks": {"T1": task},
+            "proposals": {"P1": {"proposal_id": "P1", "status": "pending"}},
+            "inbox": {"critic": [{"proposal_id": "P1", "context": large_result}]},
+        }
+        intent = {"turn_id": "turn-1", "role": "orchestration", "intent": {"kind": "propose_action", "action": "explore"}}
+        proposal = {"source": "orchestration", "proposal_id": "P1", "status": "pending"}
+        result = {"role": "critic", "proposal_id": "P1", "result": {"status": "approve"}}
+        self.session.commit([
+            ("phase_changed", {"phase": "FRAMEWORK_AGENT", "cycle": 1}),
+            ("control_checkpoint", checkpoint),
+            ("control_checkpoint", checkpoint),
+            ("agent_intent", intent),
+            ("proposal_registered", proposal),
+            ("intent_result", result),
+            ("control_checkpoint", {"tasks": {}, "proposals": {}, "inbox": {}}),
+        ])
+
+        summary = self.build()
+        html = (self.root / "report.html").read_text(encoding="utf-8")
+        raw_summary = (self.root / "summary.json").read_text(encoding="utf-8")
+        self.assertNotIn(marker, html)
+        self.assertNotIn(marker, raw_summary)
+        self.assertLess(len(html), 20_000)
+        self.assertLess(len(raw_summary), 10_000)
+        self.assertEqual(summary["phase"], "FRAMEWORK_AGENT")
+        timeline = summary["timeline"]
+        self.assertEqual(timeline[1]["seq"], 2)
+        self.assertEqual(timeline[1]["at"], self.session.events()[1]["at"])
+        self.assertEqual(timeline[1]["type"], "control_checkpoint")
+        self.assertEqual(timeline[1]["payload"], {"task_count": 1, "proposal_count": 1, "inbox_message_count": 1})
+        self.assertEqual(timeline[3]["payload"], intent)
+        self.assertEqual(timeline[4]["payload"], proposal)
+        self.assertEqual(timeline[5]["payload"], result)
+        self.assertIn('href="evidence/checkpoint-only.json"', html)
+        self.assertIn("orchestration", html)
+        self.assertIn("proposal_registered", html)
+        self.assertEqual(self.session.events()[1]["payload"], checkpoint)

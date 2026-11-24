@@ -269,13 +269,36 @@ def _profile_title(profile: Mapping[str, Any]) -> str:
     return f"{label} · rank {ranks}{suffix}"
 
 
+def _timeline_entry(event: Mapping[str, Any]) -> Mapping[str, Any]:
+    if event.get("type") != "control_checkpoint":
+        return event
+    payload = _mapping(event.get("payload"))
+    inbox = _mapping(payload.get("inbox"))
+    return {
+        "seq": event.get("seq"),
+        "at": event.get("at"),
+        "type": "control_checkpoint",
+        "payload": {
+            "task_count": len(_mapping(payload.get("tasks"))),
+            "proposal_count": len(_mapping(payload.get("proposals"))),
+            "inbox_message_count": sum(len(messages) for messages in inbox.values() if isinstance(messages, list)),
+        },
+    }
+
+
 def _event_title(event: Mapping[str, Any]) -> str:
     payload = _mapping(event.get("payload"))
+    checkpoint = ""
+    if event.get("type") == "control_checkpoint":
+        checkpoint = (
+            f"任务 {payload['task_count']} · 提案 {payload['proposal_count']}"
+            f" · 收件 {payload['inbox_message_count']}"
+        )
     pieces = (
         _label(event.get("seq"), ""),
         _label(event.get("at"), ""),
         _label(event.get("type"), ""),
-        _label(_pick(payload, "role", "agent", "phase", "task_id", "candidate_id"), ""),
+        checkpoint or _label(_pick(payload, "role", "agent", "phase", "task_id", "candidate_id"), ""),
     )
     return " · ".join(piece for piece in pieces if piece) or "事件"
 
@@ -474,7 +497,8 @@ def write_report(
     """Publish report.md, report.html and summary.json from supplied replay state."""
     root = session_dir.resolve(strict=True)
     index, warnings = _evidence_index(root)
-    timeline = _records(events)
+    raw_events = _records(events)
+    timeline = [_timeline_entry(event) for event in raw_events]
     scope = {key: manifest[key] for key in ("task", "target", "created_at", "fingerprint") if key in manifest}
     scope["runtime"] = state.get("runtime") or manifest.get("runtime")
     summary = {
@@ -493,7 +517,7 @@ def write_report(
         "sweeps": _records(state.get("sweeps")),
         "stack_validations": _records(state.get("stack_validations")),
         "timeline": timeline,
-        "evidence": _index_entries(root, index, state, timeline),
+        "evidence": _index_entries(root, index, state, raw_events),
         "stop_reason": state.get("stop_reason"),
         "report_warnings": warnings,
     }

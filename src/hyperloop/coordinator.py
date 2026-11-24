@@ -101,12 +101,9 @@ class Coordinator:
         self._events.append((event, deepcopy(payload)))
 
     def _checkpoint(self) -> None:
-        router = self.router.snapshot()
-        dispatcher = self.dispatcher.snapshot()
         self._emit("control_checkpoint", {
-            "router": router, "dispatcher": dispatcher, "agents": self.agents.snapshot(),
-            "coordinator": self._control, "tasks": dispatcher["tasks"],
-            "proposals": router["proposals"], "inbox": router["inboxes"],
+            "router": self.router.snapshot(), "dispatcher": self.dispatcher.snapshot(),
+            "agents": self.agents.snapshot(), "coordinator": self._control,
         })
         self.state = self.store.commit(self._events)
         self._events.clear()
@@ -258,7 +255,7 @@ class Coordinator:
             row.get("reason") == "cleanup_unconfirmed" for row in result.get("decisions", [])
         )
         finished = self.dispatcher.settle(
-            task["task_id"], {"receipt": receipt, **result}, cleanup=recovered_cleanup or not cleanup_pending
+            task["task_id"], self._result_summary(result, receipt), cleanup=recovered_cleanup or not cleanup_pending
         )
         if finished["status"] == "cleanup_pending":
             self._checkpoint()
@@ -290,6 +287,25 @@ class Coordinator:
         elif action in ("explore", "integrate_patch", "kernel_agent"):
             self._candidate_results(task, result, common)
         self._checkpoint()
+
+    @staticmethod
+    def _decision_summary(row: dict) -> dict:
+        fields = ("candidate_id", "parent", "kind", "backend", "status", "evidence_state",
+                  "acceptance", "version_action", "reason", "comparison", "receipt")
+        return {key: row[key] for key in fields if key in row}
+
+    @classmethod
+    def _result_summary(cls, result: dict, receipt: dict) -> dict:
+        # Full adapter output stays in one immutable receipt. Task snapshots
+        # and role inboxes carry its reference instead of copying every sample.
+        fields = ("status", "reason", "point", "backend", "fix", "ranks", "missing_ranks", "revision",
+                  "version_action", "acceptance", "evidence_state", "evidence")
+        summary = {key: result[key] for key in fields if key in result}
+        if isinstance(summary.get("revision"), dict):
+            summary["revision"] = summary["revision"]["id"]
+        if "decisions" in result:
+            summary["decisions"] = [cls._decision_summary(row) for row in result["decisions"]]
+        return {**summary, "receipt": receipt}
 
     def _candidate_results(self, task: dict, result: dict, common: dict) -> None:
         current = self.state["current_revision"]
@@ -337,12 +353,28 @@ class Coordinator:
             self._emit("candidate_decision", {"decision": decision})
 
     def _context(self, role: str) -> dict:
+        baseline = self.state["baseline"]
+        baseline_summary = None if baseline is None else {
+            "revision": baseline["revision"]["id"], "point": baseline["point"],
+            "summary": baseline["measurement"]["summary"],
+            "measurement_ref": baseline["evidence"]["revision_measurement"],
+        }
+        profile = self._last_profile()
+        profile_summary = None if profile is None else {
+            key: profile[key] for key in ("revision", "point", "rank", "ranks", "capture", "hotspots", "report_ref")
+            if key in profile
+        }
+        sweep = self.state["last_conc_sweep"]
+        sweep_summary = None if sweep is None else {
+            key: sweep[key] for key in ("status", "reason", "revision", "cycle", "receipt", "evidence") if key in sweep
+        }
         return {
             "phase": self.phase, "cycle": self.cycle, "budget": self.budget,
             "goal": self.settings["target_gain_pct"], "current_revision": self.state["current_revision"],
-            "baseline": self.state["baseline"], "profile": self._last_profile(),
-            "decisions": self.state["decisions"], "inbox": self.router.inbox_for(role),
-            "pending_proposals": self.router.pending_proposals, "last_conc_sweep": self.state["last_conc_sweep"],
+            "baseline": baseline_summary, "profile": profile_summary,
+            "decisions": [self._decision_summary(row) for row in self.state["decisions"]],
+            "inbox": self.router.inbox_for(role), "pending_proposals": self.router.pending_proposals,
+            "last_conc_sweep": sweep_summary,
             "recipe": self.state["retrieved_recipe"],
         }
 

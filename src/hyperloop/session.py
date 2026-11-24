@@ -117,8 +117,10 @@ def project(events: list[dict[str, Any]]) -> dict[str, Any]:
             state["current_revision"] = data["revision"]
         elif kind == "control_checkpoint":
             state["control"] = data
-            for key in ("tasks", "proposals", "inbox"):
-                state[key] = data.get(key, {})
+            router = data.get("router", {})
+            state["tasks"] = data.get("tasks", data.get("dispatcher", {}).get("tasks", {}))
+            state["proposals"] = data.get("proposals", router.get("proposals", {}))
+            state["inbox"] = data.get("inbox", router.get("inboxes", {}))
         elif kind == "candidate_decision":
             decision = data["decision"]
             if any(item["candidate_id"] == decision["candidate_id"] for item in state["decisions"]):
