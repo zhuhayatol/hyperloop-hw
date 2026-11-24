@@ -21,10 +21,10 @@ git tag -a base-v0.1 -m "接入 910B3 前的通用底稿"
 
 ## 2. 同步本地与 910B3
 
-用私有远程仓库同步。首次在本地关联 `origin`，推送 `main` 和底稿标签，再从 910B3 克隆。
+使用已确认的 `origin` 同步。本项目的远端目前为公开仓库，仓库保存源码、配置和可公开说明。真机原始结果与日志放在独立的 `.runs/` 目录。首次在本地关联 `origin`，推送 `main` 和底稿标签，再从 910B3 克隆。
 
 ```bash
-git remote add origin "私有仓库地址"
+git remote add origin "仓库地址"
 git push -u origin main
 git push origin base-v0.1
 ```

@@ -118,7 +118,7 @@ def _lease_processes(nonce: str) -> dict[int, _Process]:
     return owned
 
 
-def _live_group_after_cleanup(lease: Mapping[str, Any]) -> list[int]:
+def _live_group(lease: Mapping[str, Any]) -> list[int]:
     group = lease.get("pid")
     start = lease.get("start_ticks")
     if type(group) is not int or group < 1 or type(start) is not int:
@@ -135,25 +135,54 @@ def _live_group_after_cleanup(lease: Mapping[str, Any]) -> list[int]:
     return sorted(remaining)
 
 
-def _stop_lease(nonce: str) -> tuple[bool, list[int]]:
-    for sig, wait_seconds in ((signal.SIGTERM, 8), (signal.SIGKILL, 4)):
-        processes = _lease_processes(nonce)
-        if not processes:
-            return True, []
-        for pid, identity in processes.items():
-            current = _process(pid)
-            if current is not None and current.start_ticks == identity.start_ticks:
-                try:
-                    os.kill(pid, sig)
-                except ProcessLookupError:
-                    pass
-        deadline = time.monotonic() + wait_seconds
-        while time.monotonic() < deadline:
-            if not (processes := _lease_processes(nonce)):
-                return True, []
-            time.sleep(0.2)
-    processes = _lease_processes(nonce)
-    return (not processes, sorted(processes))
+def _signal_owned(processes: Mapping[int, _Process], sig: signal.Signals) -> list[int]:
+    signalled = []
+    for pid, identity in processes.items():
+        current = _process(pid)
+        if current is not None and current.state != "Z" and current.start_ticks == identity.start_ticks:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                continue
+            signalled.append(pid)
+    return sorted(signalled)
+
+
+def _wait_lease(lease: Mapping[str, Any], timeout: float) -> list[int]:
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = sorted(set(_lease_processes(lease["nonce"])) | set(_live_group(lease)))
+        if not remaining or time.monotonic() >= deadline:
+            return remaining
+        time.sleep(0.25)
+
+
+def _stop_lease(lease: Mapping[str, Any]) -> Record:
+    started = time.monotonic()
+    phases = []
+    remaining = _wait_lease(lease, 0)
+    leader = lease.get("pid")
+    for phase, sig, timeout in (("launcher_grace", signal.SIGTERM, 30),
+                                ("worker_grace", signal.SIGTERM, 8),
+                                ("forced_wait", signal.SIGKILL, 25)):
+        if not remaining:
+            break
+        owned = _lease_processes(lease["nonce"])
+        if phase == "launcher_grace":
+            identity = owned.get(leader)
+            if (identity is None or identity.start_ticks != lease.get("start_ticks")
+                    or identity.group != leader or identity.session != leader):
+                continue
+            # Let the verified launcher finish the SGLang shutdown and reap its own workers.
+            owned = {leader: identity}
+        sent = _signal_owned(owned, sig)
+        if phase == "launcher_grace" and not sent:
+            continue
+        remaining = _wait_lease(lease, timeout)
+        phases.append({"phase": phase, "signal": sig.name, "signalled_pids": sent,
+                       "wait_limit_seconds": timeout, "remaining_pids": remaining})
+    return {"released": not remaining, "remaining_pids": remaining,
+            "cleanup_wait_seconds": round(time.monotonic() - started, 3), "cleanup_phases": phases}
 
 
 def _local_path(config: Mapping[str, Any], key: str, *, default: Path | None = None) -> Path:
@@ -478,16 +507,13 @@ class SGLangBackend:
             nonce = lease["nonce"]
             if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
                 raise ValueError("invalid lease marker")
-            released, remaining = _stop_lease(nonce)
-            if released:
-                remaining = _live_group_after_cleanup(lease)
-                released = not remaining
-                if released:
-                    lease["state"] = "released"
-                    _write_lease(workspace, lease)
+            result = _stop_lease(lease)
+            if result["released"]:
+                lease["state"] = "released"
+                _write_lease(workspace, lease)
         except (OSError, ValueError, KeyError, TypeError) as error:
             raise BackendError(f"could not confirm SGLang cleanup in {workspace}: {error}") from error
-        return {"released": released, "workspace": str(workspace), "remaining_pids": remaining}
+        return {**result, "workspace": str(workspace)}
 
     def cleanup(self, prepared: Mapping[str, Any], instance: Mapping[str, Any] | None) -> Record:
         try:
