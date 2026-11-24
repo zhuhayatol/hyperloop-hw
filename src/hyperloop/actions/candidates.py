@@ -45,12 +45,17 @@ def candidate_revision(
         if "source_edit" in candidate:
             entry["source_edit"] = deepcopy(candidate["source_edit"])
         revision["framework"].append(entry)
-    elif kind == "kernel":
+    elif kind in {"kernel", "operator_patch"}:
         if not candidate.get("operator") or not candidate.get("profile_ref"):
             raise ContractError("kernel candidate must name a hotspot and its evidence")
-        revision["kernels"].append({
-            **entry, "operator": candidate["operator"], "backend": candidate["backend"],
-        })
+        kernel = {**entry, "operator": candidate["operator"], "backend": candidate["backend"]}
+        if kind == "operator_patch":
+            for field in ("patch_path", "source_edit", "invocation_marker", "pinned_source_sha256"):
+                if field not in candidate:
+                    raise ContractError(f"native operator candidate must record {field}")
+                kernel[field] = deepcopy(candidate[field])
+            kernel["operator_evidence"] = deepcopy(candidate.get("operator_evidence"))
+        revision["kernels"].append(kernel)
     else:
         raise ContractError(f"unsupported candidate kind: {kind}")
     return revision

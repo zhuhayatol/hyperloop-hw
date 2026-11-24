@@ -30,6 +30,12 @@ _LEASE = "sglang-lease.json"
 _LEASE_ENV = "HYPERLOOP_SGLANG_LEASE"
 _LOOPBACK = build_opener(ProxyHandler({}))
 _PARAMETER_FLAG = "--chunked-prefill-size"
+_FORGE_SOURCE = "python/sglang/srt/layers/activation.py"
+_FORGE_MARKER = re.compile(r"HYPERLOOP_FORGE_SWIGLU_INVOKED_[0-9a-f]{12}")
+_FORGE_CALL = re.compile(
+    r"pid=(?P<pid>[1-9][0-9]*) tokens=(?P<tokens>[1-9][0-9]*) width=(?P<width>[1-9][0-9]*) "
+    r"kernel=(?P<kernel>_hyperloop_forge_swiglu\w*) hash=(?P<hash>[0-9a-f]{16,128})"
+)
 _RESERVED_FLAGS = {
     "--host", "--port", "--model-path", "--model", "--tokenizer-path", "--device", "--dtype",
     "--attention-backend", "--tp-size", "--tensor-parallel-size", "--tp", "--dp-size",
@@ -287,6 +293,15 @@ class SGLangBackend:
             raise BackendError("target.sglang.profile must define boolean enabled and optional export_timeout")
         self._profile_enabled = profile.get("enabled", False)
         self._profile_export_timeout = _time_limit(profile, "export_timeout", 120)
+        self._native_geak = config.get("native_geak", False)
+        self._native_forge = config.get("native_forge", False)
+        if type(self._native_geak) is not bool or type(self._native_forge) is not bool:
+            raise BackendError("target.sglang native_geak and native_forge must be booleans")
+        if self._native_geak and (self._ascend_use_fia is None or not self._profile_enabled):
+            raise BackendError("native GEAK requires a locked FIA default and enabled Profile")
+        if self._native_forge and (not self._profile_enabled or not self._trial_user
+                                   or _FORGE_SOURCE not in self._allowed_source):
+            raise BackendError("native Forge requires Profile and an isolated, allow-listed SwiGLU source path")
         self._session: Path | None = None
         self._stacks: dict[str, Record] = {}
         self._hashes: dict[Path, tuple[tuple[int, int, int], str]] = {}
@@ -408,9 +423,15 @@ class SGLangBackend:
                 environment["stock_attention_control"] = {"ASCEND_USE_FIA": self._ascend_use_fia, "ASCEND_USE_FA": False}
         except (OSError, KeyError, IndexError, ValueError, TypeError) as error:
             raise BackendError(f"could not confirm the real SGLang environment: {error}") from error
+        capabilities = ["benchmark", "verify"]
+        if self._profile_enabled:
+            capabilities.append("profile")
+        for route, enabled in (("native_geak", self._native_geak), ("native_forge", self._native_forge)):
+            if enabled:
+                capabilities.append(route)
         self._probe = {
             "mode": "real", "environment": environment, "environment_fingerprint": fingerprint(environment),
-            "capabilities": ["benchmark", "verify", *(["profile"] if self._profile_enabled else [])],
+            "capabilities": capabilities,
             "npu_smoke": observed["smoke"], "npu_smi": inventory,
         }
         return deepcopy(self._probe)
@@ -420,7 +441,7 @@ class SGLangBackend:
         stack = deepcopy(dict(expected_stack))
         parameters = stack["parameters"]
         if stack["kernels"]:
-            raise BackendError("this real SGLang runtime has no separately verified device kernel integration")
+            self._validate_kernel_stack(stack["kernels"])
         for change in stack["framework"]:
             if change["kind"] == "patch":
                 source_edit(change, self._allowed_source)
@@ -441,6 +462,31 @@ class SGLangBackend:
             raise BackendError(f"revision {identifier} is already bound to a different stack")
         self._stacks[identifier] = stack
 
+    def _validate_kernel_stack(self, kernels: list[Record]) -> None:
+        if not self._native_forge or len(kernels) != 1:
+            raise BackendError("this real runtime only supports one native Forge SwiGLU overlay")
+        kernel = kernels[0]
+        if (kernel.get("kind") != "operator_patch" or kernel.get("backend") != "forge"
+                or kernel.get("operator") != "SwiGLU" or kernel.get("patch_path") != _FORGE_SOURCE
+                or not isinstance(kernel.get("invocation_marker"), str)
+                or not _FORGE_MARKER.fullmatch(kernel["invocation_marker"])):
+            raise BackendError("unrecognized native Forge operator overlay")
+        source_edit(kernel, self._allowed_source)
+        if kernel.get("pinned_source_sha256") != self._file_hash(self._source / _FORGE_SOURCE):
+            raise BackendError("native Forge overlay does not match the pinned SGLang source")
+
+    def run_native_forge(self, *, profile: Mapping[str, Any], attempt: str) -> Record:
+        from ..kernel.ascend_forge import run_forge
+
+        if not self._native_forge or not self._trial_user or self._session is None or self._child is not None:
+            raise BackendError("native Forge requires an idle, bound and protected Session")
+        uid, gid = self._trial_user
+        return run_forge(
+            python=self._python, model_config=self._model / "config.json", source_root=self._source,
+            hotspots=profile["hotspots"], workspace=self._session / "workspaces" / attempt,
+            environment=self._env, uid=uid, gid=gid,
+        )
+
     def prepare(self, revision: str, workspace: Path, *, kind: str) -> Record:
         if revision not in self._stacks or kind != "framework":
             raise BackendError("real SGLang prepare requires a bound framework revision")
@@ -455,6 +501,7 @@ class SGLangBackend:
             raise BackendError(f"could not create SGLang workspace: {error}") from error
         prepared = {"mode": "real", "revision": revision, "kind": kind, "workspace": str(workspace)}
         patches = [item for item in self._stacks[revision]["framework"] if item["kind"] == "patch"]
+        patches.extend(self._stacks[revision]["kernels"])
         if patches:
             commit = self._source_revision()
             if commit != self._target.get("software", {}).get("sglang_commit"):
@@ -557,6 +604,11 @@ class SGLangBackend:
             self._active["writable_runtime"] = str(cwd)
         if source:
             self._active["source_overlay"] = {**source, "loaded_files": observed}
+        if stack["kernels"]:
+            try:
+                self._active["kernel_log_offset"] = log.stat().st_size
+            except OSError as error:
+                raise BackendError(f"could not read the native Forge log boundary: {error}") from error
         if stock_control is not None:
             self._active["stock_attention_launch_control"] = stock_control
         return deepcopy(self._active)
@@ -576,7 +628,34 @@ class SGLangBackend:
         identity = self._observation(instance, workload)
         results = observe_outputs(instance["base_url"], workload, timeout=self._request_timeout)
         self._observation(instance, workload)
+        if instance["loaded_stack"]["kernels"]:
+            results["kernel_activation"] = self._kernel_activation(instance)
         return {**results, **identity}
+
+    def _kernel_activation(self, instance: Mapping[str, Any]) -> Record:
+        """Confirm the first correctness workload reached the staged native kernel."""
+        workspace = Path(instance["workspace"])
+        kernel = instance["loaded_stack"]["kernels"][0]
+        marker = kernel["invocation_marker"]
+        try:
+            lease = json.loads((workspace / _LEASE).read_text(encoding="utf-8"))
+            owned = _lease_processes(lease)
+            source = instance["source_overlay"]
+            staged_path = next(item["staged_path"] for item in source["files"] if item["path"] == kernel["patch_path"])
+            loaded = next(item for item in source["loaded_files"] if item["path"] == staged_path)
+            with Path(instance["server_log"]).open("rb") as stream:
+                stream.seek(instance["kernel_log_offset"])
+                for line in stream:
+                    text = line.decode("utf-8", errors="replace").strip()
+                    if not text.startswith(f"{marker} "):
+                        continue
+                    match = _FORGE_CALL.fullmatch(text.removeprefix(f"{marker} "))
+                    if match is not None and int(match["pid"]) in owned:
+                        return {**match.groupdict(), "candidate_id": kernel["candidate_id"], "marker": marker,
+                                "source_sha256": loaded["sha256"]}
+        except (OSError, ValueError, KeyError, TypeError, StopIteration) as error:
+            raise BackendError(f"could not verify native Forge invocation: {error}") from error
+        raise BackendError(f"SGLang did not invoke the staged Forge kernel during correctness requests: {marker}")
 
     def benchmark(self, instance: Mapping[str, Any], workload: Mapping[str, Any], *, repeat: int, warmup: int) -> Record:
         from .sglang_measure import benchmark

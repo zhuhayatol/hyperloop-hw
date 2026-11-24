@@ -9,8 +9,10 @@ from typing import Any
 from ..backends import BackendError, RuntimeBackend
 from ..contracts import ContractError
 from ..evaluation import Evaluator
-from ..evaluation.adjudication import adjudicate
+from ..evaluation.adjudication import adjudicate, native_operator_publication
+from ..evaluation.evidence import EvidenceProblem
 from ..evaluation.measurements import change_ratios
+from ..kernel.ascend_geak import run_ascend_geak
 from ..kernel.routes import plan_kernel_handoff
 from ..session import SessionStore
 from .candidates import candidate_revision, original_revision, stack_identity
@@ -100,10 +102,14 @@ class RuntimeActions:
     ) -> dict:
         try:
             revision = candidate_revision(spec, parent, kind)
+            if kind == "operator_patch":
+                native_operator_publication(self.store, parent["id"], revision["kernels"][-1])
             self.register(revision)
             self.register(parent)
         except ContractError as error:
             return self._blocked_candidate(spec, parent, str(error), kind=kind)
+        except EvidenceProblem as error:
+            return self._blocked_candidate(spec, parent, error.reason, kind=kind)
         evaluated = self.evaluator.candidate(
             revision["id"], parent["id"], self.workload, self.reference, self.rules,
             attempt_id=attempt,
@@ -195,8 +201,13 @@ class RuntimeActions:
             route, parent, self.workload, last_profile, plans
         )
         if real:
-            handoff["reason"] = handoff.get("reason") or "native_kernel_driver_unconfigured"
-            handoff["dispatch"] = "blocked_before_native_dispatch"
+            config = self.store.manifest["target"].get("sglang", {})
+            enabled = config.get(f"native_{route}") is True
+            if not enabled:
+                handoff["reason"] = handoff.get("reason") or "native_kernel_driver_unconfigured"
+            if route == "forge" and parent["kernels"]:
+                handoff["reason"] = handoff.get("reason") or "native_forge_operator_already_loaded"
+            handoff["dispatch"] = "blocked_before_native_dispatch" if handoff.get("reason") else "native_dispatch"
             handoff["source_correlated_hotspots"] = [hit for hit in (last_profile or {}).get("hotspots", [])
                                                      if hit.get("callsite")]
         if task["params"].get("cycle", 1) > 1:
@@ -207,8 +218,10 @@ class RuntimeActions:
             f"evidence/kernel/{task['task_id']}-handoff.json", handoff, producer="kernel_handoff"
         )
         if real:
-            return {"status": "blocked", "backend": route, "handoff": handoff, "decisions": [],
-                    "reason": handoff["reason"], "evidence": {"handoff": handoff_ref}}
+            if handoff.get("reason"):
+                return {"status": "blocked", "backend": route, "handoff": handoff, "decisions": [],
+                        "reason": handoff["reason"], "evidence": {"handoff": handoff_ref}}
+            return self._native_kernel(task["task_id"], state, last_profile, handoff, handoff_ref, config)
         results = []
         for index, spec in enumerate(specs):
             attempt = f"{task['task_id']}-k{index}"
@@ -235,6 +248,71 @@ class RuntimeActions:
             "reason": handoff.get("reason") or ("no_candidates" if not results else "candidates_settled"),
             "evidence": {"handoff": handoff_ref, "delivery": tool_ref},
         }
+
+    def _native_kernel(
+        self, task_id: str, state: dict, profile: dict, handoff: dict, handoff_ref: dict, config: dict,
+    ) -> dict:
+        parent = state["current_revision"]
+        route = handoff["backend"]
+        publication_path = f"evidence/kernel/{task_id}-delivery.json"
+        if route == "geak":
+            publication, spec = run_ascend_geak(
+                task_id=task_id, parent=parent, profile=profile, fia_default=config.get("ascend_use_fia"),
+                measure=self._measure_geak_trial,
+            )
+            kind = "parameters"
+            delivery_ref = self.store.put_evidence(publication_path, publication, producer="native_geak")
+        else:
+            kind = "operator_patch"
+            run_forge = getattr(self.backend, "run_native_forge", None)
+            try:
+                if run_forge is None:
+                    raise BackendError("the pinned runtime does not expose native Forge")
+                publication = run_forge(profile=profile, attempt=f"{task_id}-forge")
+            except BackendError as error:
+                publication = {"status": "blocked", "reason": "native_forge_unavailable", "detail": str(error)}
+            publication.update(mode="real", backend="forge", delivery="operator_patch",
+                               target_revision=parent["id"], profile_ref=profile["report_ref"])
+            spec = publication.get("candidate") if publication["status"] == "ok" else None
+            if spec is not None:
+                spec = {
+                    **spec, "id": f"{task_id}-forge-swiglu", "parent": parent["id"], "backend": "forge",
+                    "profile_ref": profile["report_ref"],
+                }
+                publication["candidate"] = spec
+            delivery_ref = self.store.put_evidence(publication_path, publication, producer="native_forge")
+            if spec is not None:
+                spec = {**spec, "operator_evidence": delivery_ref}
+        result = {"status": publication["status"], "reason": publication["reason"], "backend": route,
+                  "handoff": handoff, "decisions": [], "evidence": {"handoff": handoff_ref, "delivery": delivery_ref}}
+        if spec is not None:
+            decision = self.evaluate_candidate(spec, parent, state["baseline"], f"{task_id}-independent", kind)
+            decision["tool_evidence"] = {"publication": delivery_ref}
+            result["decisions"].append(decision)
+            if decision["status"] != "ok":
+                result.update(status=decision["status"], reason=decision["reason"])
+        return result
+
+    def _measure_geak_trial(self, revision: dict, attempt: str) -> dict:
+        measured = self.measure(revision, attempt)
+        if measured["status"] != "ok" or not attempt.endswith("-geak-candidate"):
+            return measured
+        profile = self.profile({"task_id": f"{attempt}-activation"}, {"current_revision": revision})
+        use_fia = revision["parameters"]["ascend_use_fia"]
+        operator = "fusedinferattentionscore" if use_fia else "flashattention"
+        matches = [
+            hit for hit in profile.get("hotspots", [])
+            if operator in hit.get("name", "").casefold()
+            and hit.get("callsite", "").startswith("sglang/srt/hardware_backend/npu/attention/ascend_backend.py:")
+        ]
+        measured["activation"] = {
+            "status": profile["status"], "revision": profile["revision"], "expected_operator": operator,
+            "matches": matches, "evidence": profile["evidence"],
+        }
+        if not matches or profile["status"] != "ok":
+            measured.update(status="blocked", reason=profile["reason"] if profile["status"] != "ok"
+                            else "geak_attention_activation_unconfirmed")
+        return measured
 
     def _kernel_candidate(self, spec: dict, parent: dict, baseline: dict, attempt: str) -> dict:
         try:

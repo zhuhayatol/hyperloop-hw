@@ -543,7 +543,7 @@ class Coordinator:
     def _last_profile(self) -> dict | None:
         return next((item for item in reversed(self.state["profiles"]) if item["status"] == "ok"), None)
 
-    def _profile_due(self) -> bool:
+    def _profile_due(self, *, require_current: bool = False) -> bool:
         revision = self.state["current_revision"]
         if (
             not revision or not self.settings["profile_enabled"] or self.budget < 1
@@ -552,7 +552,7 @@ class Coordinator:
             return False
         if any(item.get("revision") == revision["id"] for item in self.state["profiles"]):
             return False
-        return should_reprofile(revision, self._last_profile(), self.settings["reprofile_ratio"])
+        return require_current or should_reprofile(revision, self._last_profile(), self.settings["reprofile_ratio"])
 
     def _framework(self) -> None:
         if self._profile_due():
@@ -587,9 +587,10 @@ class Coordinator:
 
     def _kernel(self) -> None:
         route = self.settings["kernel_backend"]
-        if route == "forge" and self._profile_due():
+        native = f"native_{route}" in self.state["runtime"]["capabilities"]
+        if (native or route == "forge") and self._profile_due(require_current=native):
             revision = self.state["current_revision"]["id"]
-            self._register("profile", key=f"profile:{revision}", reason="forge_entry")
+            self._register("profile", key=f"profile:{revision}", reason=f"{route}_entry")
         elif self.budget >= 1 and not self._phase_tasks("kernel_agent"):
             self._register("kernel_agent", backend=route)
         else:

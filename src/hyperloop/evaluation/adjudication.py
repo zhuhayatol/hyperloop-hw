@@ -169,6 +169,71 @@ def _verify(
     return computed
 
 
+def native_operator_publication(store: SessionStore, parent: str, kernel: Record) -> Record:
+    """Bind the isolated Forge build and test to the exact patch offered to the service."""
+    reference = kernel.get("operator_evidence")
+    if (not isinstance(reference, dict) or reference.get("producer") != "native_forge"
+            or not store.verify_evidence(reference)):
+        raise EvidenceProblem("native_forge_publication_unverified", "missing", "blocked")
+    try:
+        raw = store.artifact_path(reference["path"]).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != reference["sha256"]:
+            raise ValueError("publication changed after verification")
+        publication = json.loads(raw, object_pairs_hook=_unique_keys, parse_constant=_invalid_constant)
+        spec = publication["candidate"]
+        operator = publication["evidence"]["operator"]
+        supported = spec["supported_input"]
+        if (publication["mode"] != "real" or publication["status"] != "ok"
+                or publication["delivery"] != "operator_patch" or publication["target_revision"] != parent
+                or spec["id"] != kernel["candidate_id"] or spec["parent"] != parent
+                or not store.verify_evidence(publication["profile_ref"])
+                or operator["status"] != "complete" or len(operator["cases"]) != 2
+                or any(spec[key] != kernel[key] for key in (
+                    "operator", "backend", "source_edit", "patch_path", "invocation_marker", "pinned_source_sha256"
+                ))):
+            raise ValueError("publication identity mismatch")
+        names = set()
+        for row in operator["cases"]:
+            compiled = row["compiled"]
+            timings = row["stream_event_us"]
+            if (row["timing_status"] != "complete" or row["dtype"] != supported["dtype"]
+                    or row["input_shape"][-1] != supported["width"]
+                    or any(row["correctness"][key]["pass"] is not True
+                           for key in ("stock_vs_cpu", "candidate_vs_cpu"))
+                    or not any(item["kind"] == "npubin" for item in compiled["artifacts"])
+                    or any(len(timings[key]) != operator["repeats"] or not timings[key]
+                           or not all(numeric(sample) and sample > 0 for sample in timings[key])
+                           or median(timings[key]) != row["median_us"][key]
+                           for key in ("torch_npu_stock", "triton_candidate"))):
+                raise ValueError("operator checks or samples incomplete")
+            names.add(compiled["name"])
+    except (OSError, ContractError, ValueError, TypeError, KeyError, IndexError, AttributeError) as error:
+        raise EvidenceProblem("native_forge_publication_invalid", "incomparable", "blocked") from error
+    return {"reference": reference, "compiled_names": names, "supported_input": supported}
+
+
+def _verify_native_activation(proof: _AttemptProof, instance: Record, parent: str) -> Record:
+    try:
+        kernel = instance["loaded_stack"]["kernels"][-1]
+        verified = native_operator_publication(proof.store, parent, kernel)
+        observed = proof.read("candidate_service_outputs", "runtime_backend")["kernel_activation"]
+        source = instance["source_overlay"]
+        file = next(item for item in source["files"] if item["path"] == kernel["patch_path"])
+        loaded = next(item for item in source["loaded_files"] if item["path"] == file["staged_path"])
+        supported = verified["supported_input"]
+        if (observed["candidate_id"] != kernel["candidate_id"] or observed["marker"] != kernel["invocation_marker"]
+                or observed["kernel"] not in verified["compiled_names"]
+                or not supported["tokens"][0] <= int(observed["tokens"]) <= supported["tokens"][1]
+                or int(observed["width"]) * 2 != supported["width"]
+                or file["pinned_sha256"] != kernel["pinned_source_sha256"]
+                or observed["source_sha256"] != loaded["sha256"] or loaded["sha256"] != file["expected_sha256"]):
+            raise ValueError("observed operator identity differs from the verified patch")
+    except (TypeError, ValueError, IndexError, KeyError, StopIteration) as error:
+        raise EvidenceProblem("native_forge_activation_invalid", "incomparable", "blocked") from error
+    proof.verified["native_forge_publication"] = verified["reference"]["id"]
+    return observed
+
+
 def _measure(
     proof: _AttemptProof, context: Record, instance: Record, rules: EvaluationPolicy, arm: str
 ) -> Record:
@@ -258,6 +323,8 @@ def _review(
     arm = "kernel" if standalone_kernel else "revision" if standalone_service else "candidate"
     instance = _instance(proof, context, revision, arm, "kernel" if kernel and not standalone_service else "framework")
     result["runtime"] = instance
+    if decision.get("kind") == "operator_patch":
+        result["kernel_activation"] = _verify_native_activation(proof, instance, parent_revision["id"])
     if kernel and not standalone_service:
         if proof.read("kernel_reference", "evaluation") != kernel_reference:
             raise EvidenceProblem("adjudication_kernel_reference_mismatch")
