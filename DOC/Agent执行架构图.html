@@ -68,7 +68,7 @@ main{max-width:1300px;margin:auto;padding:35px 28px 52px}h1{font-size:clamp(29px
     <div class="kicker">通用底稿 · 设计稿</div>
     <h1>Hyperloop Agent 执行架构</h1>
     <p class="intro">沿阶段看谁把什么交给谁。上游页对应 Hyperloom 的调度与 Agent 交接。下层执行页沿同一任务走完昇腾上的启动、验证、计时和留证。</p>
-    <div class="links"><a href="源码架构参考.html#map">源码架构参考总图</a><a href="源码架构参考.html#journey">上游交接走读</a><a href="源码架构参考.html#arch-step-kernel-backend">Attention 双路线</a><a href="通用底稿初步规划.md">通用底稿规划</a></div>
+    <div class="links"><a href="优化任务与交付架构.html">从优化任务到交付</a><a href="源码架构参考.html#map">源码架构参考总图</a><a href="源码架构参考.html#journey">上游交接走读</a><a href="源码架构参考.html#arch-step-kernel-backend">Attention 双路线</a><a href="通用底稿初步规划.md">通用底稿规划</a></div>
   </header>
   <nav class="tabs" id="tabs" aria-label="架构视图"></nav>
   <section class="stage" id="stage"></section>
@@ -76,7 +76,7 @@ main{max-width:1300px;margin:auto;padding:35px 28px 52px}h1{font-size:clamp(29px
     <article><h3>模拟第一轮 · 框架参数</h3><p>原始 100 → Explore 复测 110 → 独立验收 <strong>KEEP</strong>。达到上次采集锚点的 1.10 倍时再检查复采条件。</p></article>
     <article><h3>模拟第二轮 · 算子补丁</h3><p>Forge 交补丁 → 服务复测 112 → 相对 110 为 +1.82%，低于示例门槛 2%，<strong>REVERT</strong>，接受版仍为 110。</p></article>
   </section>
-  <p class="scope">依据本地 Hyperloom-main 1.1.5 快照及源码课。数值为走读示例。实现和双 910B2 验收待开展。</p>
+  <p class="scope">依据本地 Hyperloom-main 1.1.5 快照及源码课。数值为走读示例。Hyperloop 底稿已通过本地模拟验收。真实 Agent、910B3 与双 910B2 执行和优化产物待接入验收。</p>
   <noscript>启用 JavaScript 可查看离线交互图，也可打开上方规划文档查看完整流程。</noscript>
 </main>
 <script>
