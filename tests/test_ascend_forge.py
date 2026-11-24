@@ -1,9 +1,13 @@
+import json
 from pathlib import Path
+import signal
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 
 from hyperloop.backends.runtime import BackendError
-from hyperloop.kernel.ascend_forge import SWIGLU_PATH, _WORKER, _operator_edit, run_forge
+from hyperloop.kernel.ascend_forge import SWIGLU_PATH, _WORKER, _operator_edit, _run_worker, run_forge
 
 
 _ACTIVATION = b'''\
@@ -50,3 +54,41 @@ class AscendForgeTests(unittest.TestCase):
             self.assertEqual(outcome["status"], "blocked")
             self.assertEqual(outcome["reason"], "no_source_correlated_forge_swiglu_hotspot")
             self.assertFalse(workspace.exists())
+
+    def test_worker_has_a_durable_nonce_lease_before_running(self):
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            lease_path = workspace / "sglang-lease.json"
+            process = Mock(pid=7331, returncode=0)
+            process.poll.return_value = 0
+
+            def start(*_args, env, **_kwargs):
+                staged = json.loads(lease_path.read_text(encoding="utf-8"))
+                self.assertEqual(staged["state"], "launching")
+                self.assertEqual(staged["run_uid"], 61000)
+                self.assertIsNone(staged["pid"])
+                self.assertEqual(env["HYPERLOOP_SGLANG_LEASE"], staged["nonce"])
+                return process
+
+            def wait(*_args, **_kwargs):
+                running = json.loads(lease_path.read_text(encoding="utf-8"))
+                self.assertEqual(running["state"], "running")
+                self.assertEqual(running["pid"], 7331)
+                self.assertEqual(running["start_ticks"], 457)
+                return 0
+
+            def write_lease(directory, value):
+                self.assertEqual(directory, workspace)
+                lease_path.write_text(json.dumps(value), encoding="utf-8")
+
+            process.wait.side_effect = wait
+            with (patch("hyperloop.kernel.ascend_forge.subprocess.Popen", side_effect=start),
+                  patch("hyperloop.backends.sglang._write_lease", side_effect=write_lease),
+                  patch("hyperloop.backends.sglang._process", return_value=SimpleNamespace(start_ticks=457)),
+                  patch("hyperloop.backends.sglang._lease_processes", return_value={}),
+                  patch("hyperloop.backends.sglang._live_group", return_value=[]),
+                  patch.object(signal, "SIGKILL", 9, create=True)):
+                result = _run_worker(["python"], {}, workspace, workspace, 61000, 5)
+            self.assertEqual(result["remaining_pids"], [])
+            self.assertTrue(result["process_group_clear"])
+            self.assertEqual(json.loads(lease_path.read_text(encoding="utf-8"))["state"], "released")

@@ -175,7 +175,7 @@ def _stop_lease(lease: Mapping[str, Any]) -> Record:
         if not remaining:
             break
         owned = _lease_processes(lease)
-        if "run_uid" in lease:
+        if "run_uid" in lease and type(leader) is int:
             owned = {pid: identity for pid, identity in owned.items() if identity.session == leader}
         if phase == "launcher_grace":
             identity = owned.get(leader)
@@ -728,8 +728,10 @@ class SGLangBackend:
         if self._session is None:
             return {"released": False, "reason": "SGLang provider has no bound Session for recovery"}
         attempts = []
-        for path in sorted((self._session / "workspaces").glob(f"*/*/{_LEASE}")):
-            if not path.resolve().is_relative_to(self._session / "workspaces") or path.is_symlink():
+        workspaces = self._session / "workspaces"
+        leases = [*workspaces.glob(f"*/*/{_LEASE}"), *workspaces.glob(f"*/{_LEASE}")]
+        for path in sorted(leases):
+            if not path.resolve().is_relative_to(workspaces) or path.is_symlink():
                 return {"released": False, "reason": f"invalid lease path: {path}", "attempts": attempts}
             try:
                 lease = json.loads(path.read_text(encoding="utf-8"))

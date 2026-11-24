@@ -201,7 +201,7 @@ class RuntimeActions:
             route, parent, self.workload, last_profile, plans
         )
         if real:
-            config = self.store.manifest["target"].get("sglang", {})
+            config = self.store.manifest.get("target", {}).get("sglang", {})
             enabled = config.get(f"native_{route}") is True
             if not enabled:
                 handoff["reason"] = handoff.get("reason") or "native_kernel_driver_unconfigured"
@@ -285,6 +285,8 @@ class RuntimeActions:
                 spec = {**spec, "operator_evidence": delivery_ref}
         result = {"status": publication["status"], "reason": publication["reason"], "backend": route,
                   "handoff": handoff, "decisions": [], "evidence": {"handoff": handoff_ref, "delivery": delivery_ref}}
+        if result["reason"] == "forge_worker_cleanup_unconfirmed":
+            result["reason"] = "cleanup_unconfirmed"
         if spec is not None:
             decision = self.evaluate_candidate(spec, parent, state["baseline"], f"{task_id}-independent", kind)
             decision["tool_evidence"] = {"publication": delivery_ref}

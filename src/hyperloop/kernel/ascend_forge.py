@@ -16,6 +16,7 @@ import subprocess
 from textwrap import indent
 import time
 from typing import Any
+from uuid import uuid4
 
 from ..backends.runtime import BackendError, Record
 from ..backends.sglang_overlay import dedicated_launch, protected_paths
@@ -172,41 +173,55 @@ def _check_worker(output: Path, *, worker_digest: str, model_digest: str, width:
     return result
 
 
-def _group_exists(group: int) -> bool:
-    try:
-        os.killpg(group, 0)
-    except ProcessLookupError:
-        return False
-    return True
+def _run_worker(
+    command: list[str], environment: Mapping[str, str], runtime: Path, workspace: Path, uid: int, timeout: int,
+) -> Record:
+    from ..backends.sglang import _LEASE_ENV, _lease_processes, _live_group, _process, _signal_owned, _write_lease
 
-
-def _run_worker(command: list[str], environment: Mapping[str, str], runtime: Path, log: Path, timeout: int) -> Record:
     started = time.monotonic()
-    with log.open("wb") as stream:
-        process = subprocess.Popen(command, cwd=runtime, env=environment, start_new_session=True,
-                                   stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT)
-        timed_out = False
-        try:
+    nonce = uuid4().hex
+    lease = {"nonce": nonce, "state": "launching", "kind": "forge_operator", "run_uid": uid, "pid": None}
+    _write_lease(workspace, lease)
+    process = None
+    timed_out = False
+    try:
+        with (workspace / "forge-worker.log").open("xb") as stream:
+            process = subprocess.Popen(command, cwd=runtime, env={**environment, _LEASE_ENV: nonce},
+                                       start_new_session=True, stdin=subprocess.DEVNULL, stdout=stream,
+                                       stderr=subprocess.STDOUT, umask=0o027)
+            lease.update(state="running", pid=process.pid)
+            if (identity := _process(process.pid)) is not None:
+                lease["start_ticks"] = identity.start_ticks
+            _write_lease(workspace, lease)
             process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-        finally:
-            if _group_exists(process.pid):
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    finally:
+        if process is not None:
+            # A live child or a verified descendant establishes ownership of the group.
+            if process.poll() is None or _live_group(lease):
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                try:
-                    process.wait(10)
-                except subprocess.TimeoutExpired:
-                    pass
-                for _ in range(20):
-                    if not _group_exists(process.pid):
-                        break
-                    time.sleep(0.05)
-        return {"exit_code": process.poll(), "timed_out": timed_out,
-                "process_group_clear": not _group_exists(process.pid),
-                "elapsed_seconds": time.monotonic() - started}
+            _signal_owned(_lease_processes(lease), signal.SIGKILL)
+            try:
+                process.wait(10)
+            except subprocess.TimeoutExpired:
+                pass
+        deadline = time.monotonic() + 1
+        while True:
+            remaining = sorted(set(_lease_processes(lease)) | set(_live_group(lease)))
+            clear = not remaining and (process is None or process.poll() is not None)
+            if clear or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        if clear:
+            lease["state"] = "released"
+            _write_lease(workspace, lease)
+    return {"exit_code": process.returncode, "timed_out": timed_out, "process_group_clear": clear,
+            "remaining_pids": remaining, "lease_state": lease["state"],
+            "elapsed_seconds": time.monotonic() - started}
 
 
 def run_forge(
@@ -215,7 +230,7 @@ def run_forge(
 ) -> Record:
     """Build and test one source-correlated candidate before offering its exact source edit."""
     receipt: Record = {"strategy": "packaged_triton_ascend_swiglu", "worker_log": "forge-worker.log",
-                       "worker_evidence_root": "runtime/evidence"}
+                       "worker_evidence_root": "runtime/evidence", "worker_lease": "sglang-lease.json"}
     result: Record = {"status": "blocked", "evidence": receipt}
     try:
         model = model_config.read_bytes()
@@ -239,7 +254,7 @@ def run_forge(
             str(python), "-c", _WATCH_COORDINATOR, str(os.getpid()), str(worker_path),
             "--output", str(output), "--model-config", str(model_config),
         ], {key: value for key, value in environment.items() if key != "PYTHONPATH"}, workspace, None, uid, gid)
-        process = _run_worker(command, env, runtime, workspace / "forge-worker.log", timeout)
+        process = _run_worker(command, env, runtime, workspace, uid, timeout)
         receipt["worker_process"] = process
         if not process["process_group_clear"]:
             return {**result, "status": "failed", "reason": "forge_worker_cleanup_unconfirmed"}
