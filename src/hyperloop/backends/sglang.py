@@ -582,6 +582,9 @@ class SGLangBackend:
         if self._trial_user is not None:
             protected_paths([workspace], *self._trial_user)
             command, env, cwd = dedicated_launch(command, env, workspace, source, *self._trial_user)
+        if stack["kernels"]:
+            # The generating /health probe would consume the first, request-scoped invocation marker.
+            env = {**env, "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "0"}
         lease = {"nonce": nonce, "state": "launching", "pid": None, "port": port,
                  "revision": revision, "launch_command": command}
         if self._trial_user is not None:
@@ -624,6 +627,7 @@ class SGLangBackend:
                 self._active["kernel_log_offset"] = log.stat().st_size
             except OSError as error:
                 raise BackendError(f"could not read the native Forge log boundary: {error}") from error
+            self._active["health_readiness_scope"] = "model_loaded_without_generation"
         if stock_control is not None:
             self._active["stock_attention_launch_control"] = stock_control
         return deepcopy(self._active)
