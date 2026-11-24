@@ -32,6 +32,12 @@ class IntentRouter:
     def inbox_for(self, role: str) -> list[dict[str, Any]]:
         return deepcopy(self._inboxes.get(role, []))
 
+    def expire_pending(self, phase: str, reason: str) -> None:
+        for proposal in self._proposals.values():
+            if proposal["phase"] == phase and proposal["status"] == "pending":
+                proposal.update(status="expired", reason=reason)
+                self._publish(proposal["source"], "proposal_expired", proposal)
+
     def route(self, role: str, phase: str, intent: Mapping[str, Any]) -> dict[str, Any]:
         try:
             self.policy.authorize(role, phase, intent)

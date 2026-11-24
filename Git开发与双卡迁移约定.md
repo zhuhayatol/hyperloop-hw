@@ -11,7 +11,7 @@
 
 ## 1. 在本地固定通用底稿
 
-先完成 Coordinator、Session、候选执行、正确性校验和 KEEP/REVERT 裁决，预留环境接入点。在本地用模拟执行器走通闭环，记录标记为 `simulated`。底稿验收后，在 `Hyperloop/` 内初始化 Git，将源码、脱敏配置和项目文档提交到 `main`。模型权重、虚拟环境、凭据和大体积原始记录按各自路径保存，并通过 `.gitignore` 排除。
+先在 `Hyperloop/` 内初始化 Git，将设计基准提交到 `main`。每批提交源码、测试和修改日志，再进入下一批。用本地模拟执行器验证 Coordinator、Session、候选执行、正确性校验和 KEEP/REVERT 裁决，记录标为 `simulated`。模型权重、虚拟环境、凭据和大体积原始记录按各自路径保存，并通过 `.gitignore` 排除。
 
 在底稿提交上打标签。
 

@@ -59,6 +59,10 @@ class ReplayAgentBackend:
         self._cursors[role] += 1
         return deepcopy(turns[index])
 
+    def has_next(self, role: str) -> bool:
+        """An explicit empty turn still occupies a saved response slot."""
+        return self._cursors[role] < len(self._responses.get(role, ()))
+
     def snapshot(self) -> dict[str, Any]:
         return {"cursors": dict(self._cursors)}
 

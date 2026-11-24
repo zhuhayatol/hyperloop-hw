@@ -108,6 +108,45 @@ class Evaluator:
 
         return self._run(frozen, attempt_id, {"verify", "kernel"}, operation, rules, trusted)
 
+    def forward(
+        self,
+        revision: str,
+        workload: Mapping[str, Any],
+        reference: Mapping[str, list[float]],
+        policy: Mapping[str, Any],
+        *,
+        attempt_id: str,
+        expected_stack: Mapping[str, Any] | None = None,
+    ) -> Record:
+        """Record the optional model-forward timing at its own boundary."""
+        frozen = copy.deepcopy(dict(workload))
+        trusted = self._freeze_reference(reference, frozen)
+        rules = EvaluationPolicy.load(policy)
+
+        def operation(attempt: AttemptEvidence, context: Record, result: Record) -> None:
+            with self._service(attempt, context, revision, "forward", "model_forward", expected_stack) as instance:
+                verified = self._verify(attempt, context, instance, trusted, rules, "forward", "service")
+                result["correctness"] = verified
+                if not verified["pass"]:
+                    _failed_correctness(result, "forward_correctness_failed")
+                    result["version_action"] = "HOLD"
+                    return
+                raw = self.backend.forward_timer(copy.deepcopy(instance), copy.deepcopy(frozen))
+                attempt.save("forward_raw", raw, "model_timer")
+                self._assert_observation(raw, instance, context)
+                samples = raw.get("samples_ms")
+                if (
+                    raw.get("boundary") != "model_forward" or not isinstance(samples, list)
+                    or not samples or not all(numeric(item) and item > 0 for item in samples)
+                ):
+                    raise EvidenceProblem("invalid_forward_timing", "incomparable")
+                timing = {"boundary": "model_forward", "samples_ms": samples, "median_ms": median(samples)}
+                result["forward_timing"] = timing
+                attempt.save("forward_timing", timing, "evaluation")
+            _positive_outcome(result, "forward_evaluation_complete")
+
+        return self._run(frozen, attempt_id, {"verify", "forward"}, operation, rules, trusted)
+
     def candidate(
         self,
         revision: str,
@@ -423,6 +462,13 @@ class Evaluator:
         rank_rows = raw.get("ranks")
         if raw.get("boundary") != "profile_capture" or not isinstance(rank_rows, list):
             raise EvidenceProblem("profile_boundary_mismatch", "incomparable")
+        capture = raw.get("capture")
+        window = capture.get("window_us") if isinstance(capture, dict) else None
+        if (
+            not isinstance(window, list) or len(window) != 2 or not all(numeric(value) for value in window)
+            or window[0] >= window[1] or not capture.get("tool") or not capture.get("tool_version")
+        ):
+            raise EvidenceProblem("profile_capture_metadata_missing", "missing", "partial")
         expected = {int(rank) for rank in context["probe"]["environment"]["rank_map"]}
         ranks: set[int] = set()
         hotspots: list[Record] = []
@@ -435,9 +481,12 @@ class Evaluator:
                 raise EvidenceProblem("profile_rank_revision_mismatch")
             ranks.add(rank)
             hotspots.extend(rank_hotspots(row))
-        result.update(ranks=sorted(ranks), missing_ranks=sorted(expected - ranks), hotspots=hotspots,
+        result.update(ranks=sorted(ranks), missing_ranks=sorted(expected - ranks), hotspots=hotspots, capture=capture,
                       revision=revision, workload_fingerprint=context["workload_fingerprint"],
                       environment_fingerprint=context["environment_fingerprint"])
-        attempt.save("profile_analysis", {key: result[key] for key in ("ranks", "missing_ranks", "hotspots")}, "trace_analysis")
+        attempt.save(
+            "profile_analysis", {key: result[key] for key in ("ranks", "missing_ranks", "hotspots", "capture")},
+            "trace_analysis",
+        )
         if result["missing_ranks"]:
             raise EvidenceProblem("profile_ranks_missing", "missing", "partial")

@@ -93,6 +93,7 @@ def _initial_state() -> dict[str, Any]:
         "last_conc_sweep": None,
         "stack_validations": [],
         "recipes": [],
+        "retrieved_recipe": None,
         "round_attempts": [],
         "stop_reason": None,
     }
@@ -137,6 +138,8 @@ def project(events: list[dict[str, Any]]) -> dict[str, Any]:
             state["stack_validations"].append(data)
         elif kind == "recipe_recorded":
             state["recipes"].append(data)
+        elif kind == "recipe_retrieved":
+            state["retrieved_recipe"] = data
         elif kind == "candidate_attempt":
             state["round_attempts"].append(data)
         elif kind == "stopped":
@@ -172,7 +175,10 @@ class SessionStore:
         }
         manifest.pop("fingerprint", None)
         manifest["fingerprint"] = digest(manifest)
-        path = root.resolve() / mode / session_id
+        root = root.resolve()
+        path = root / mode / session_id
+        if not path.resolve().is_relative_to(root):
+            raise ContractError("Session directory escapes its root")
         path.mkdir(parents=True)
         atomic_write(path / "manifest.json", json_bytes(manifest))
         atomic_write(path / "events.jsonl", b"")
@@ -256,7 +262,8 @@ class SessionStore:
 
     def put_evidence(self, reference: str, data: Any, *, producer: str) -> dict[str, str]:
         location = self.artifact_path(reference)
-        if not PurePosixPath(reference).is_relative_to("evidence"):
+        parts = PurePosixPath(reference).parts
+        if len(parts) < 2 or parts[0] != "evidence":
             raise ContractError("Session-owned evidence must be stored under evidence/")
         content = json_bytes(data)
         with file_lease(self.path / ".evidence.lock"):

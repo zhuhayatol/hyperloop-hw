@@ -174,18 +174,25 @@ def rank_hotspots(rank_record: Mapping[str, Any]) -> list[dict[str, Any]]:
     events = rank_record.get("events")
     if not isinstance(events, list):
         raise EvidenceProblem("profile_events_invalid")
-    grouped: dict[tuple[str, str], list[float]] = defaultdict(list)
+    grouped: dict[tuple[str, str, tuple[int, ...], str], list[float]] = defaultdict(list)
     for event in events:
         if not isinstance(event, dict):
             raise EvidenceProblem("profile_event_invalid")
         name = event.get("name")
         callsite = event.get("callsite")
         duration = event.get("duration_us")
-        if not isinstance(name, str) or not isinstance(callsite, str) or not numeric(duration) or duration < 0:
+        shape = event.get("input_shape", [])
+        dtype = event.get("dtype", "")
+        if (
+            not isinstance(name, str) or not isinstance(callsite, str) or not numeric(duration) or duration < 0
+            or not isinstance(shape, list) or any(type(dim) is not int or dim < 1 for dim in shape)
+            or not isinstance(dtype, str)
+        ):
             raise EvidenceProblem("profile_event_invalid")
-        grouped[name, callsite].append(duration)
+        grouped[name, callsite, tuple(shape), dtype].append(duration)
     return sorted(
         [{"rank": rank_record["rank"], "name": name, "callsite": callsite, "events": len(durations),
-          "duration_us": sum(durations)} for (name, callsite), durations in grouped.items()],
+          "duration_us": sum(durations), "input_shape": list(shape), "dtype": dtype}
+         for (name, callsite, shape, dtype), durations in grouped.items()],
         key=lambda item: (-item["duration_us"], item["name"], item["callsite"]),
     )

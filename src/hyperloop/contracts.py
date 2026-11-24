@@ -89,9 +89,15 @@ def validate_task(task: dict[str, Any]) -> dict[str, Any]:
     model = _mapping(task.get("model"), "model")
     for key in ("id", "revision", "tokenizer", "tokenizer_revision", "dtype"):
         _text(model.get(key), f"model.{key}")
+    if "allowed_parameters" in task:
+        allowed = task["allowed_parameters"]
+        if not isinstance(allowed, list) or any(not isinstance(item, str) or not item for item in allowed):
+            raise ContractError("allowed_parameters must be a list of parameter names")
 
     workload = _mapping(task.get("workload"), "workload")
     safe_id(workload.get("id"), "workload.id")
+    if workload.get("dtype") != model["dtype"]:
+        raise ContractError("workload dtype must match the frozen model dtype")
     _integer(workload.get("concurrency"), "workload.concurrency", minimum=1)
     requests = _list(workload.get("requests"), "workload.requests")
     request_ids: set[str] = set()
@@ -101,8 +107,13 @@ def validate_task(task: dict[str, Any]) -> dict[str, Any]:
         if request_id in request_ids:
             raise ContractError(f"duplicate request: {request_id}")
         request_ids.add(request_id)
-        for key in ("input_tokens", "output_tokens"):
-            _integer(request.get(key), f"request.{key}", minimum=1)
+        input_tokens = request.get("input_tokens")
+        if isinstance(input_tokens, list):
+            for token in _list(input_tokens, "request.input_tokens"):
+                _integer(token, "input token ID", minimum=0)
+        else:
+            _integer(input_tokens, "request.input_tokens", minimum=1)
+        _integer(request.get("output_tokens"), "request.output_tokens", minimum=1)
     _mapping(workload.get("sampling"), "workload.sampling")
 
     rules = _mapping(task.get("rules"), "rules")
@@ -110,7 +121,10 @@ def validate_task(task: dict[str, Any]) -> dict[str, Any]:
     _integer(rules.get("warmup"), "rules.warmup", minimum=0)
     for key in ("min_gain_pct", "max_ttft_regression_pct", "max_tpot_regression_pct", "tolerance"):
         _number(rules.get(key), f"rules.{key}")
-    _text(rules.get("time_boundary"), "rules.time_boundary")
+    if "noise_floor_pct" in rules:
+        _number(rules["noise_floor_pct"], "rules.noise_floor_pct")
+    if rules.get("time_boundary") != "service_end_to_end":
+        raise ContractError("service performance rules must use the service_end_to_end boundary")
 
     settings = _mapping(task.get("settings"), "settings")
     if settings.get("kernel_backend") not in ("geak", "forge", "disabled"):
@@ -118,6 +132,8 @@ def validate_task(task: dict[str, Any]) -> dict[str, Any]:
     for key in ("framework_enabled", "enablement", "profile_enabled", "sweep_enabled"):
         if type(settings.get(key)) is not bool:
             raise ContractError(f"settings.{key} must be boolean")
+    if "record_model_forward" in settings and type(settings["record_model_forward"]) is not bool:
+        raise ContractError("settings.record_model_forward must be boolean")
     for key in ("max_cycles", "budget", "max_turns_per_cycle"):
         _integer(settings.get(key), f"settings.{key}", minimum=1)
     _number(settings.get("reprofile_ratio"), "settings.reprofile_ratio", minimum=1)

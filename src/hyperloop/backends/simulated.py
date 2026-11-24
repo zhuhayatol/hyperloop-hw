@@ -25,12 +25,23 @@ class SimulatedBackend:
     ) -> None:
         self._target = copy.deepcopy(dict(target))
         self._revisions = {name: copy.deepcopy(dict(spec)) for name, spec in (revisions or {}).items()}
+        self._bound_stacks: dict[str, Record] = {}
         self._active: str | None = None
         self.calls: list[tuple[str, str | None]] = []
 
     def register_revision(self, revision: str, spec: Mapping[str, Any]) -> None:
         """Register a distinct simulated revision for later evaluation."""
         self._revisions[revision] = copy.deepcopy(dict(spec))
+
+    def bind_revision(self, revision: Mapping[str, Any], *, expected_stack: Mapping[str, Any]) -> None:
+        """Associate the supplied revision with the corresponding fixture observations."""
+        identifier = revision["id"]
+        if identifier not in self._revisions:
+            raise BackendError(f"no simulated observation defined for revision {identifier}")
+        stack = copy.deepcopy(dict(expected_stack))
+        if identifier in self._bound_stacks and self._bound_stacks[identifier] != stack:
+            raise BackendError(f"revision {identifier} already has a different bound stack")
+        self._bound_stacks[identifier] = stack
 
     def _spec(self, revision: str) -> Record:
         return self._revisions.get(revision, {})
@@ -55,7 +66,7 @@ class SimulatedBackend:
     def probe(self) -> Record:
         self.calls.append(("probe", None))
         environment = self._environment()
-        default_capabilities = ["verify", "benchmark", "profile", "kernel"]
+        default_capabilities = ["verify", "benchmark", "profile", "kernel", "forward"]
         if environment["tp_size"] > 1:
             default_capabilities.append("hccl")
         capabilities = self._target.get("capabilities", default_capabilities)
@@ -90,10 +101,11 @@ class SimulatedBackend:
             raise BackendError("simulated launch failure after resource acquisition")
         loaded_revision = f"old-{revision}" if "old_implementation" in faults else revision
         spec = self._spec(revision)
-        loaded_stack = copy.deepcopy(spec.get("loaded_stack", {
+        default_stack = self._bound_stacks.get(revision, {
             "framework": spec.get("framework", loaded_revision),
             "kernels": spec.get("kernels", []),
-        }))
+        })
+        loaded_stack = copy.deepcopy(spec.get("loaded_stack", default_stack))
         environment = self._environment()
         environment_fingerprint = fingerprint(environment)
         if "wrong_environment" in faults:
@@ -206,10 +218,18 @@ class SimulatedBackend:
         self.calls.append(("profile", revision))
         faults = self._faults(revision)
         ranks = range(self._target["tp_size"] - (1 if "profile_missing_rank" in faults else 0))
+        token_lengths = [
+            len(item["input_tokens"]) if isinstance(item["input_tokens"], list) else item["input_tokens"]
+            for item in workload["requests"]
+        ]
         return {
             **self._observation(instance, workload),
             "boundary": "profile_capture",
-            "clock_domain": "per_rank",
+            "capture": {
+                "tool": "simulated-profiler", "tool_version": "1",
+                "window_us": [0.0, 1000.0], "clock_domain": "per_rank",
+                "cross_rank_alignment": "unavailable",
+            },
             "ranks": [
                 {
                     "rank": rank,
@@ -218,6 +238,8 @@ class SimulatedBackend:
                         "name": "simulated_attention",
                         "callsite": "simulated://attention",
                         "duration_us": 90.0 + rank,
+                        "input_shape": [max(token_lengths), 128],
+                        "dtype": workload.get("dtype", "float32"),
                     }],
                 }
                 for rank in ranks
@@ -232,6 +254,16 @@ class SimulatedBackend:
             **self._observation(instance, workload),
             "boundary": "kernel_device",
             "samples_us": list(samples) if isinstance(samples, (list, tuple)) else [float(samples)],
+        }
+
+    def forward_timer(self, instance: Mapping[str, Any], workload: Mapping[str, Any]) -> Record:
+        revision = instance["revision"]
+        self.calls.append(("forward_timer", revision))
+        samples = self._spec(revision).get("forward_ms", [20.0, 20.5, 19.5])
+        return {
+            **self._observation(instance, workload),
+            "boundary": "model_forward",
+            "samples_ms": list(samples) if isinstance(samples, (list, tuple)) else [float(samples)],
         }
 
     def cleanup(
@@ -250,4 +282,7 @@ class SimulatedBackend:
         """Check adapter ownership before resuming a task after interruption."""
         # This adapter owns in-memory instances only. A new adapter cannot
         # inherit an actual process or device allocation.
-        return {"mode": "simulated", "released": self._active is None, "scope": "in_memory"}
+        if self._active is not None:
+            return {"mode": "simulated", "released": False, "scope": "in_memory",
+                    "reason": "simulated process still active"}
+        return {"mode": "simulated", "released": True, "scope": "in_memory"}

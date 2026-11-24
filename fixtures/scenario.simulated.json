@@ -1,0 +1,117 @@
+{
+  "agents": {
+    "orchestration": [
+      [
+        {
+          "kind": "delegate",
+          "action": "explore",
+          "idempotency_key": "explore-prefill",
+          "params": {
+            "candidates": [
+              {
+                "id": "R01",
+                "parameters": {"chunked_prefill_size": 4096},
+                "reason": "Profile identifies attention as a prefill bottleneck.",
+                "expected_metric": "service throughput",
+                "risk": "TTFT regression under the same workload",
+                "validation": "Validate reference outputs and compare matched service samples."
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "kind": "delegate",
+          "action": "specialist",
+          "idempotency_key": "author-framework",
+          "params": {"mode": "author", "focus": "attention call path"}
+        }
+      ],
+      [
+        {"kind": "escalate_strategy_change", "next_action_hint": "skip_to_kernel"}
+      ]
+    ],
+    "critic": [
+      [
+        {
+          "kind": "review_verdict",
+          "proposal_id": "review-R02",
+          "verdict": "approve",
+          "reason": "The proposal identifies a bounded source change, its risk and a comparison method."
+        }
+      ]
+    ],
+    "specialist": [
+      [
+        {
+          "kind": "propose_action",
+          "action": "integrate_patch",
+          "proposal_id": "review-R02",
+          "params": {
+            "candidate": {
+              "id": "R02",
+              "patch_path": "sglang/attention.py",
+              "reason": "Use the simulated attention callsite to target redundant setup.",
+              "expected_metric": "service throughput",
+              "risk": "The changed serving path may produce different output.",
+              "validation": "Confirm the loaded revision and compare reference outputs before timing."
+            }
+          }
+        }
+      ]
+    ]
+  },
+  "revisions": {
+    "base": {"throughput": [99.8, 100.0, 100.2], "ttft_ms": [125.0, 125.2, 124.9], "tpot_ms": 28.0},
+    "base-unavailable": {"faults": ["launch"]},
+    "base-fixed": {"throughput": [99.8, 100.0, 100.2], "ttft_ms": [125.0, 125.2, 124.9], "tpot_ms": 28.0},
+    "R01": {"throughput": [109.8, 110.0, 110.2], "ttft_ms": 124.0, "tpot_ms": 27.8},
+    "R02": {"throughput": [114.8, 115.0, 115.2], "ttft_ms": 124.0, "tpot_ms": 27.4},
+    "K-FORGE": {"throughput": [121.8, 122.0, 122.2], "ttft_ms": 123.0, "tpot_ms": 27.0, "device_us": [81.0, 80.0, 81.0]},
+    "K-GEAK": {"throughput": [121.8, 122.0, 122.2], "ttft_ms": 123.0, "tpot_ms": 27.0},
+    "R03": {"throughput": [122.8, 123.0, 123.2], "ttft_ms": 123.0, "tpot_ms": 27.0, "device_us": [79.0, 80.0, 79.0]}
+  },
+  "kernel_plans": {
+    "forge": [
+      {
+        "id": "K-FORGE",
+        "operator": "attention",
+        "reason": "The active trace attributes work to the attention operator.",
+        "expected_metric": "kernel device time and service throughput",
+        "risk": "A faster operator may change outputs or fail to improve the full service.",
+        "validation": "Compare kernel and service outputs separately and retain separate timings."
+      },
+      {
+        "id": "R03",
+        "operator": "attention",
+        "reason": "Evaluate a follow-up scheduling tweak on the same operator.",
+        "expected_metric": "service throughput",
+        "risk": "The resulting gain may be smaller than the locked threshold.",
+        "validation": "Measure it against the latest accepted stack on the same workload."
+      }
+    ],
+    "geak": [
+      {
+        "id": "K-GEAK",
+        "operator": "attention",
+        "reason": "Rebench the service revision returned by the simulated route.",
+        "expected_metric": "service throughput",
+        "risk": "An adapter result may be incomparable with the accepted service revision.",
+        "validation": "Use the project-owned reference and repeat the service comparison."
+      },
+      {
+        "id": "R03",
+        "operator": "attention",
+        "reason": "Check a second serving configuration from the simulated route.",
+        "expected_metric": "service throughput",
+        "risk": "The gain over the previously accepted kernel may be negligible.",
+        "validation": "Compare fixed service samples against the current accepted parent revision."
+      }
+    ]
+  },
+  "enablement": {
+    "revision": "base-fixed",
+    "reason": "Replace the unusable simulated launch configuration and measure the first runnable baseline."
+  }
+}

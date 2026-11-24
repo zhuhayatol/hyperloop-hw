@@ -1,0 +1,48 @@
+{
+  "id": "attention-demo",
+  "initial_revision": "base",
+  "allowed_parameters": ["chunked_prefill_size"],
+  "model": {
+    "id": "Qwen2.5-0.5B-Instruct",
+    "revision": "simulated-model-v1",
+    "tokenizer": "Qwen2.5",
+    "tokenizer_revision": "simulated-tokenizer-v1",
+    "dtype": "bfloat16"
+  },
+  "workload": {
+    "id": "prefill-decode",
+    "dtype": "bfloat16",
+    "concurrency": 4,
+    "requests": [
+      {"id": "prefill-01", "phase": "prefill", "input_tokens": 4096, "output_tokens": 32},
+      {"id": "prefill-02", "phase": "prefill", "input_tokens": 4096, "output_tokens": 32},
+      {"id": "decode-01", "phase": "decode", "input_tokens": 128, "output_tokens": 256},
+      {"id": "decode-02", "phase": "decode", "input_tokens": 128, "output_tokens": 256}
+    ],
+    "sampling": {"temperature": 0.0, "seed": 42, "ignore_eos": true}
+  },
+  "rules": {
+    "repeats": 3,
+    "warmup": 2,
+    "min_gain_pct": 2.0,
+    "noise_floor_pct": 0.5,
+    "max_ttft_regression_pct": 5.0,
+    "max_tpot_regression_pct": 5.0,
+    "tolerance": 0.001,
+    "time_boundary": "service_end_to_end"
+  },
+  "settings": {
+    "framework_enabled": true,
+    "enablement": true,
+    "profile_enabled": true,
+    "record_model_forward": true,
+    "sweep_enabled": true,
+    "kernel_backend": "forge",
+    "max_cycles": 2,
+    "budget": 40,
+    "max_turns_per_cycle": 4,
+    "reprofile_ratio": 1.1,
+    "target_gain_pct": 30.0,
+    "sweep_concurrency": [1, 4, 8]
+  }
+}

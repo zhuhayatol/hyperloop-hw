@@ -1,0 +1,11 @@
+{
+  "id": "910b3-tp1-simulated",
+  "mode": "simulated",
+  "devices": ["simulated-910b3-0"],
+  "tp_size": 1,
+  "software": {
+    "runtime": "simulated-v1",
+    "framework": "SGLang fixture"
+  },
+  "capabilities": ["verify", "benchmark", "profile", "kernel", "forward"]
+}

@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from hyperloop.agents import ReplayAgentBackend
 from hyperloop.dispatcher import Dispatcher
@@ -136,6 +137,13 @@ class AgentRoutingTest(unittest.TestCase):
                 self._propose("link-check", patch_path="linked/change.diff")["code"],
                 "patch_path_outside_workspace",
             )
+
+    def test_resolved_patch_outside_workspace_is_rejected(self) -> None:
+        # Exercise the resolved-path guard on hosts without link creation rights.
+        outside = self.policy.workspace.parent / "different-workspace" / "change.diff"
+        with patch.object(Path, "resolve", return_value=outside):
+            decision = self._propose("resolved-check", patch_path="linked/change.diff")
+        self.assertEqual(decision["code"], "patch_path_outside_workspace")
 
     def test_critic_empty_inbox_does_not_advance_replay_cursor(self) -> None:
         proposed = {"kind": "review_verdict", "proposal_id": "patch", "verdict": "approve"}

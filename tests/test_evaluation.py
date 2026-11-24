@@ -168,6 +168,14 @@ class EvaluationTests(TestCase):
         self.assertIn("device_timing", result)
         self.assertNotIn("measurement", result)
 
+    def test_model_forward_timing_is_its_own_boundary(self):
+        result = self.evaluator.forward("original", WORKLOAD, REFERENCE, POLICY, attempt_id="forward")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["forward_timing"]["boundary"], "model_forward")
+        self.assertNotIn("measurement", result)
+        self.assertIn(("forward_timer", "original"), self.backend.calls)
+        self.assertFalse(any(name == "benchmark" for name, _ in self.backend.calls))
+
     def test_attempt_identifiers_and_evidence_cannot_be_overwritten(self):
         baseline = self.baseline()
         frozen_file = self.root / baseline["evidence"]["decision"]["path"]
