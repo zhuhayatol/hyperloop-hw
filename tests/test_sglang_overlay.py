@@ -82,7 +82,7 @@ class SGLangSourceOverlayTest(unittest.TestCase):
             "loaded_stack": {"kernels": [{"candidate_id": "forge-1", "invocation_marker": marker,
                                           "patch_path": self.patch_path}]},
             "source_overlay": {"files": [{"path": self.patch_path, "staged_path": staged}],
-                               "loaded_files": [{"path": staged, "sha256": "b" * 64}]},
+                               "loaded_files": [{"path": staged, "sha256": "b" * 64, "pid": 42}]},
         }
         backend = object.__new__(SGLangBackend)
         with patch("hyperloop.backends.sglang._lease_processes", return_value={42: object()}):
@@ -93,6 +93,12 @@ class SGLangSourceOverlayTest(unittest.TestCase):
             activated = backend._kernel_activation(instance)
         self.assertEqual((activated["candidate_id"], activated["pid"], activated["source_sha256"]),
                          ("forge-1", "42", "b" * 64))
+        self.assertEqual(activated["process_binding"], "inherited_lease")
+        with (patch("hyperloop.backends.sglang._lease_processes", return_value={}),
+              patch("hyperloop.backends.sglang._live_group", return_value=[42, 99])):
+            activated = backend._kernel_activation(instance)
+        self.assertEqual(activated["pid"], "42")
+        self.assertEqual(activated["process_binding"], "same_session_and_loaded_file")
 
     def test_sandbox_masks_private_config_and_keeps_compile_caches_in_the_trial(self):
         home = self.root / "home"

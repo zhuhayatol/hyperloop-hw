@@ -662,6 +662,8 @@ class SGLangBackend:
             source = instance["source_overlay"]
             staged_path = next(item["staged_path"] for item in source["files"] if item["path"] == kernel["patch_path"])
             loaded = next(item for item in source["loaded_files"] if item["path"] == staged_path)
+            # The dedicated scheduler's /proc environment can be unreadable even to the evaluator.
+            loader_joined_lease = loaded["pid"] in _live_group(lease)
             with Path(instance["server_log"]).open("rb") as stream:
                 stream.seek(instance["kernel_log_offset"])
                 for line in stream:
@@ -669,9 +671,14 @@ class SGLangBackend:
                     if not text.startswith(f"{marker} "):
                         continue
                     match = _FORGE_CALL.fullmatch(text.removeprefix(f"{marker} "))
-                    if match is not None and int(match["pid"]) in owned:
+                    if match is None:
+                        continue
+                    pid = int(match["pid"])
+                    inherited = pid in owned
+                    if inherited or (loader_joined_lease and pid == loaded["pid"]):
                         return {**match.groupdict(), "candidate_id": kernel["candidate_id"], "marker": marker,
-                                "source_sha256": loaded["sha256"]}
+                                "source_sha256": loaded["sha256"],
+                                "process_binding": "inherited_lease" if inherited else "same_session_and_loaded_file"}
         except (OSError, ValueError, KeyError, TypeError, StopIteration) as error:
             raise BackendError(f"could not verify native Forge invocation: {error}") from error
         raise BackendError(f"SGLang did not invoke the staged Forge kernel during correctness requests: {marker}")

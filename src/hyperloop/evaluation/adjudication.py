@@ -225,6 +225,8 @@ def _verify_native_activation(proof: _AttemptProof, instance: Record, parent: st
                 or observed["kernel"] not in verified["compiled_names"]
                 or not supported["tokens"][0] <= int(observed["tokens"]) <= supported["tokens"][1]
                 or int(observed["width"]) * 2 != supported["width"]
+                or observed.get("process_binding") not in {"inherited_lease", "same_session_and_loaded_file"}
+                or (observed["process_binding"] == "same_session_and_loaded_file" and int(observed["pid"]) != loaded["pid"])
                 or file["pinned_sha256"] != kernel["pinned_source_sha256"]
                 or observed["source_sha256"] != loaded["sha256"] or loaded["sha256"] != file["expected_sha256"]):
             raise ValueError("observed operator identity differs from the verified patch")
