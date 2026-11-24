@@ -211,7 +211,15 @@ def _profile_phase(
         except BackendError as stop_error:
             raise BackendError(f"{error}; could not stop the Ascend profile: {stop_error}") from error
         raise
-    stop_ack = _profile_api(base_url, "/stop_profile", export_timeout, {})
+    stop_error = None
+    try:
+        stop_ack = _profile_api(base_url, "/stop_profile", export_timeout, {})
+    except BackendError as error:
+        if steps is None or not str(error).startswith("SGLang /stop_profile returned HTTP 500:"):
+            raise
+        # SGLang returns 500 when its step-limited capture has already stopped.
+        # Accept that response only if this capture still yields a verified trace below.
+        stop_ack, stop_error = "", str(error)
     exported, export_receipt = offline_export(directory, phase) if offline_export is not None else (None, None)
     if offline_export is not None and (not isinstance(exported, Path) or not isinstance(export_receipt, dict)):
         raise BackendError("Offline Ascend exporter must return its trace path and receipt")
@@ -225,6 +233,8 @@ def _profile_phase(
         capture["export"] = {"method": "offline_same_capture", "receipt": export_receipt}
     if steps is not None:
         capture["num_steps"] = steps
+    if stop_error is not None:
+        capture["stop_error"] = stop_error
     return rows, capture
 
 

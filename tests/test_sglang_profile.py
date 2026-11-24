@@ -48,7 +48,14 @@ class AscendProfileTests(unittest.TestCase):
                 patch("hyperloop.backends.sglang_profile._complete", return_value={"meta_info": {
                     "id": "long", "prompt_tokens": 2, "completion_tokens": 2,
                 }}):
-            api.return_value = "Cache flushed."
+            stop_error = "SGLang /stop_profile returned HTTP 500: Internal Server Error"
+
+            def server_api(_base_url, endpoint, _timeout, _body=None):
+                if endpoint == "/stop_profile":
+                    raise BackendError(stop_error)
+                return "Cache flushed."
+
+            api.side_effect = server_api
             root = Path(work).resolve()
             broken_contents = '{"traceEvents": ['
 
@@ -74,6 +81,7 @@ class AscendProfileTests(unittest.TestCase):
             self.assertEqual(phase["trace"]["path"], "profile/prefill/offline-export/trace_view.json")
             self.assertEqual(phase["trace"]["kernel_events"], 1)
             self.assertEqual(phase["num_steps"], 4)
+            self.assertEqual(phase["stop_error"], stop_error)
             self.assertEqual(phase["export"], {"method": "offline_same_capture",
                                                "receipt": {"raw_capture_sha256": "verified-source"}})
             self.assertEqual((root / "profile" / "prefill" / "capture" / "trace_view.json").read_text(encoding="utf-8"),
