@@ -303,6 +303,12 @@ class Coordinator:
         summary = {key: result[key] for key in fields if key in result}
         if isinstance(summary.get("revision"), dict):
             summary["revision"] = summary["revision"]["id"]
+        if "handoff" in result:
+            handoff = result["handoff"]
+            summary["handoff"] = {
+                key: handoff[key] for key in ("backend", "delivery", "target_revision", "selected", "reason", "profile_ref")
+                if key in handoff
+            }
         if "decisions" in result:
             summary["decisions"] = [cls._decision_summary(row) for row in result["decisions"]]
         return {**summary, "receipt": receipt}

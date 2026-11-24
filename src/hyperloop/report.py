@@ -208,6 +208,12 @@ def _measurement(record: Any) -> Mapping[str, Any]:
     return _mapping(measurement.get("summary"))
 
 
+def _metric_value(value: Any) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return f"{value:.6g}"
+    return _label(value)
+
+
 def _measurement_rows(
     decision: Mapping[str, Any], baseline: Any
 ) -> list[tuple[str, str, str, str]]:
@@ -225,9 +231,9 @@ def _measurement_rows(
             rows.append(
                 (
                     label,
-                    _label(values.get("throughput")),
-                    _label(values.get("ttft_ms")),
-                    _label(values.get("tpot_ms")),
+                    _metric_value(values.get("throughput")),
+                    _metric_value(values.get("ttft_ms")),
+                    _metric_value(values.get("tpot_ms")),
                 )
             )
     return rows
