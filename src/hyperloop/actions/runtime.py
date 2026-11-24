@@ -184,12 +184,21 @@ class RuntimeActions:
     def kernel(self, task: dict, state: dict) -> dict:
         parent = state["current_revision"]
         route = task["params"]["backend"]
-        last_profile = next((item for item in reversed(state["profiles"]) if item["status"] == "ok"), None)
+        real = self.store.manifest["mode"] == "real"
+        last_profile = next((item for item in reversed(state["profiles"]) if item["status"] == "ok" and (
+            not real or item.get("revision") == parent["id"]
+        )), None)
         if last_profile is not None and not self.store.verify_evidence(last_profile.get("report_ref") or {}):
             last_profile = None
+        plans = [] if real else self.scenario.get("kernel_plans", {}).get(route, [])
         handoff, specs = plan_kernel_handoff(
-            route, parent, self.workload, last_profile, self.scenario.get("kernel_plans", {}).get(route, [])
+            route, parent, self.workload, last_profile, plans
         )
+        if real:
+            handoff["reason"] = handoff.get("reason") or "native_kernel_driver_unconfigured"
+            handoff["dispatch"] = "blocked_before_native_dispatch"
+            handoff["source_correlated_hotspots"] = [hit for hit in (last_profile or {}).get("hotspots", [])
+                                                     if hit.get("callsite")]
         if task["params"].get("cycle", 1) > 1:
             settled = {item["candidate_id"] for item in state["decisions"]}
             specs = [spec for spec in specs if spec["id"] not in settled]
@@ -197,6 +206,9 @@ class RuntimeActions:
         handoff_ref = self.store.put_evidence(
             f"evidence/kernel/{task['task_id']}-handoff.json", handoff, producer="kernel_handoff"
         )
+        if real:
+            return {"status": "blocked", "backend": route, "handoff": handoff, "decisions": [],
+                    "reason": handoff["reason"], "evidence": {"handoff": handoff_ref}}
         results = []
         for index, spec in enumerate(specs):
             attempt = f"{task['task_id']}-k{index}"
