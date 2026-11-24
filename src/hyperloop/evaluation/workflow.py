@@ -227,11 +227,53 @@ class Evaluator:
                     ):
                         raise EvidenceProblem("invalid_forward_timing", "incomparable")
                     timing = {"boundary": "model_forward", "samples_ms": samples, "median_ms": median(samples)}
+                    if isinstance(instance.get("model_forward"), dict):
+                        timing["phases"] = self._verify_forward_replays(raw, instance["model_forward"], trusted)
                     result["forward_timing"] = timing
                     attempt.save("forward_timing", timing, "evaluation")
             _positive_outcome(result, "forward_evaluation_complete")
 
         return self._run(frozen, attempt_id, {"verify", "forward"}, operation, rules, trusted)
+
+    @staticmethod
+    def _verify_forward_replays(raw: Record, measurement: Record, reference: Mapping[str, list[float]]) -> Record:
+        """Bind each timed replay to the protected expected tokens and recompute phase metrics."""
+        windows = raw.get("repeats")
+        if (not isinstance(windows, list) or len(windows) != measurement.get("repeats")
+                or raw.get("model_symbol") != measurement.get("symbol") or raw.get("graph_replay") is not False
+                or raw.get("profile_enabled") is not False):
+            raise EvidenceProblem("invalid_forward_replay_scope", "incomparable")
+        phases: dict[str, list[float]] = {}
+        all_samples = []
+        window_ids = set()
+        for index, window in enumerate(windows):
+            if not isinstance(window, dict) or window.get("repeat") != index:
+                raise EvidenceProblem("invalid_forward_replay_window", "incomparable")
+            window_id = window.get("window")
+            if not isinstance(window_id, str) or not window_id or window_id in window_ids:
+                raise EvidenceProblem("invalid_forward_replay_window", "incomparable")
+            window_ids.add(window_id)
+            requests = window.get("requests")
+            if not isinstance(requests, list) or len(requests) != len(reference):
+                raise EvidenceProblem("forward_replay_output_mismatch", "incomparable")
+            outputs = {row["request_id"]: row.get("output") for row in requests
+                       if isinstance(row, dict) and isinstance(row.get("request_id"), str)}
+            if outputs != reference:
+                raise EvidenceProblem("forward_replay_output_mismatch", "incomparable")
+            rows = window.get("samples")
+            if not isinstance(rows, list) or not rows:
+                raise EvidenceProblem("invalid_forward_replay_samples", "incomparable")
+            for row in rows:
+                phase = row.get("phase") if isinstance(row, dict) else None
+                elapsed = row.get("elapsed_ms") if isinstance(row, dict) else None
+                if (phase not in ("prefill", "decode", "mixed") or row.get("window") != window_id
+                        or not numeric(elapsed) or elapsed <= 0):
+                    raise EvidenceProblem("invalid_forward_replay_samples", "incomparable")
+                phases.setdefault(phase, []).append(elapsed)
+                all_samples.append(elapsed)
+        if all_samples != raw["samples_ms"]:
+            raise EvidenceProblem("forward_replay_samples_mismatch", "incomparable")
+        return {phase: {"count": len(values), "median_ms": median(values)} for phase, values in phases.items()}
 
     def candidate(
         self,

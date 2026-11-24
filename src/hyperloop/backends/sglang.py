@@ -22,6 +22,9 @@ from urllib.request import ProxyHandler, build_opener
 from uuid import uuid4
 
 from .runtime import BackendError, Record, fingerprint
+from .sglang_forward import (
+    FORWARD_CONTROL_ENV, FORWARD_SOURCE, FORWARD_SYMBOL, forward_repeats, forward_source_edit, measure_forward,
+)
 from .sglang_overlay import dedicated_launch, loaded_sources, protected_paths, sandbox_launch, source_edit, source_path, stage_overlay
 from .sglang_profile_export import export_capture, exporter_owner
 
@@ -309,6 +312,17 @@ class SGLangBackend:
         if self._native_forge and (not self._profile_enabled or not self._trial_user
                                    or _FORGE_SOURCE not in self._allowed_source):
             raise BackendError("native Forge requires Profile and an isolated, allow-listed SwiGLU source path")
+        self._forward_repeats = forward_repeats(config.get("model_forward", {}))
+        if self._forward_repeats is not None:
+            if self._trial_user is None:
+                raise BackendError("real model-forward measurement requires a dedicated, isolated SGLang account")
+            try:
+                model_config = json.loads((self._model / "config.json").read_bytes())
+            except (OSError, ValueError) as error:
+                raise BackendError(f"could not read the locked model-forward architecture: {error}") from error
+            if (not isinstance(model_config, dict) or model_config.get("model_type") != "qwen2"
+                    or model_config.get("architectures") != ["Qwen2ForCausalLM"]):
+                raise BackendError("real model-forward measurement requires Qwen2ForCausalLM")
         self._session: Path | None = None
         self._stacks: dict[str, Record] = {}
         self._hashes: dict[Path, tuple[tuple[int, int, int], str]] = {}
@@ -375,6 +389,8 @@ class SGLangBackend:
             raise BackendError("the real SGLang runtime requires Linux")
         if self._trial_user is not None:
             sources = [self._source / path for path in self._allowed_source]
+            if self._forward_repeats is not None:
+                sources.append(self._source / FORWARD_SOURCE)
             protected_paths([self._python, self._source, self._model, self._tokenizer, Path(__file__), *sources],
                             *self._trial_user)
         try:
@@ -436,11 +452,18 @@ class SGLangBackend:
                 }
             if self._profile_steps is not None:
                 environment["profile_scheduler_steps"] = self._profile_steps
+            if self._forward_repeats is not None:
+                environment["model_forward_measurement"] = {
+                    "symbol": FORWARD_SYMBOL, "repeats": self._forward_repeats, "graph_replay": False,
+                    "pinned_source_sha256": self._file_hash(self._source / FORWARD_SOURCE),
+                }
         except (OSError, KeyError, IndexError, ValueError, TypeError) as error:
             raise BackendError(f"could not confirm the real SGLang environment: {error}") from error
         capabilities = ["benchmark", "verify"]
         if self._profile_enabled:
             capabilities.append("profile")
+        if self._forward_repeats is not None:
+            capabilities.append("forward")
         for route, enabled in (("native_geak", self._native_geak), ("native_forge", self._native_forge)):
             if enabled:
                 capabilities.append(route)
@@ -503,8 +526,10 @@ class SGLangBackend:
         )
 
     def prepare(self, revision: str, workspace: Path, *, kind: str) -> Record:
-        if revision not in self._stacks or kind != "framework":
-            raise BackendError("real SGLang prepare requires a bound framework revision")
+        if revision not in self._stacks or kind not in {"framework", "model_forward"}:
+            raise BackendError("real SGLang prepare requires a bound framework or model-forward revision")
+        if kind == "model_forward" and self._forward_repeats is None:
+            raise BackendError("real SGLang model-forward measurement is not enabled")
         if self._child is not None:
             raise BackendError("an earlier SGLang instance still needs cleanup")
         workspace = workspace.resolve()
@@ -517,11 +542,15 @@ class SGLangBackend:
         prepared = {"mode": "real", "revision": revision, "kind": kind, "workspace": str(workspace)}
         patches = [item for item in self._stacks[revision]["framework"] if item["kind"] == "patch"]
         patches.extend(self._stacks[revision]["kernels"])
+        allowed_source = self._allowed_source
+        if kind == "model_forward":
+            patches.append(forward_source_edit())
+            allowed_source |= {FORWARD_SOURCE}
         if patches:
             commit = self._source_revision()
             if commit != self._target.get("software", {}).get("sglang_commit"):
                 raise BackendError("a source candidate requires the pinned SGLang commit")
-            prepared["source_overlay"] = stage_overlay(self._source, workspace, patches, self._allowed_source, commit=commit)
+            prepared["source_overlay"] = stage_overlay(self._source, workspace, patches, allowed_source, commit=commit)
         return prepared
 
     def _wait_ready(self, opener_url: str, expected: Mapping[str, Any], log: Path) -> Record:
@@ -566,6 +595,9 @@ class SGLangBackend:
         workspace = Path(prepared["workspace"])
         log = workspace / "server.log"
         args, chunk = _chunk_args(self._server_args, stack["parameters"].get("chunked_prefill_size"))
+        forward_only = prepared["kind"] == "model_forward"
+        if forward_only and "--disable-cuda-graph" not in args:
+            args.append("--disable-cuda-graph")
         command = [str(self._python), "-u", "-m", "sglang.launch_server", "--host", _HOST, "--port", str(port),
                    "--model-path", str(self._model), "--tokenizer-path", str(self._tokenizer),
                    "--served-model-name", model_name, "--device", "npu", "--attention-backend", "ascend",
@@ -585,6 +617,8 @@ class SGLangBackend:
         if stack["kernels"]:
             # The generating /health probe would consume the first, request-scoped invocation marker.
             env = {**env, "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "0"}
+        if forward_only:
+            env = {**env, FORWARD_CONTROL_ENV: str(workspace / "model-forward.window")}
         lease = {"nonce": nonce, "state": "launching", "pid": None, "port": port,
                  "revision": revision, "launch_command": command}
         if self._trial_user is not None:
@@ -609,6 +643,8 @@ class SGLangBackend:
         }
         if chunk is not None:
             expected["chunked_prefill_size"] = chunk
+        if forward_only:
+            expected["disable_cuda_graph"] = True
         loaded = self._wait_ready(base_url, expected, log)
         observed = loaded_sources(log, source) if source else []
         self._active = {
@@ -622,6 +658,11 @@ class SGLangBackend:
             self._active["writable_runtime"] = str(cwd)
         if source:
             self._active["source_overlay"] = {**source, "loaded_files": observed}
+        if forward_only:
+            self._active["model_forward"] = {
+                "symbol": FORWARD_SYMBOL, "source": FORWARD_SOURCE, "repeats": self._forward_repeats,
+                "graph_replay": False,
+            }
         if stack["kernels"]:
             try:
                 self._active["kernel_log_offset"] = log.stat().st_size
@@ -687,6 +728,8 @@ class SGLangBackend:
         from .sglang_measure import benchmark
 
         identity = self._observation(instance, workload)
+        if instance.get("model_forward"):
+            raise BackendError("the isolated model-forward service does not provide end-to-end timing")
         results = benchmark(instance["base_url"], workload, repeat=repeat, warmup=warmup, timeout=self._request_timeout)
         self._observation(instance, workload)
         return {**results, **identity}
@@ -724,7 +767,27 @@ class SGLangBackend:
         raise BackendError("real SGLang kernel timing is not available in this provider")
 
     def forward_timer(self, instance: Mapping[str, Any], workload: Mapping[str, Any]) -> Record:
-        raise BackendError("real SGLang model forward timing is not available in this provider")
+        identity = self._observation(instance, workload)
+        if self._forward_repeats is None or not instance.get("model_forward"):
+            raise BackendError("real model-forward timing requires a dedicated measurement service")
+        workspace = Path(instance["workspace"])
+        try:
+            lease = json.loads((workspace / _LEASE).read_text(encoding="utf-8"))
+            source = instance["source_overlay"]
+            staged = next(row["staged_path"] for row in source["files"] if row["path"] == FORWARD_SOURCE)
+            loaded = next(row for row in source["loaded_files"] if row["path"] == staged)
+            workers = set(_lease_processes(lease))
+            if loaded["pid"] in _live_group(lease):
+                workers.add(loaded["pid"])
+            if not workers:
+                raise BackendError("could not verify the active SGLang model-forward worker")
+            samples = measure_forward(instance["base_url"], workload, repeats=self._forward_repeats,
+                                      control=workspace / "model-forward.window", log=Path(instance["server_log"]),
+                                      workers=workers, timeout=self._request_timeout)
+        except (OSError, ValueError, KeyError, TypeError, StopIteration) as error:
+            raise BackendError(f"could not confirm the owned SGLang model-forward measurement: {error}") from error
+        self._observation(instance, workload)
+        return {**samples, "loaded_instrumentation": loaded, **identity}
 
     def _cleanup_workspace(self, workspace: Path) -> Record:
         path = workspace / _LEASE
