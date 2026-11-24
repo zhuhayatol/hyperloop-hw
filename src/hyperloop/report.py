@@ -7,12 +7,14 @@ import hashlib
 from html import escape
 import json
 import math
+import re
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote
 
 from .contracts import json_bytes
 from .session import atomic_write
+from .validation_graph import build_reproduction_graphs, build_validation_graphs
 
 
 _STYLES = """
@@ -33,6 +35,33 @@ _STYLES = """
   dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: .35rem 1rem; }
   dd { margin: 0; overflow-wrap: anywhere; }
   li { overflow-wrap: anywhere; }
+  .validation-task { border-color: color-mix(in srgb, CanvasText 30%, Canvas); scroll-margin-top: 1rem; }
+  .validation-task:target, .timeline-event:target { outline: 2px solid Highlight; outline-offset: 3px; }
+  .flow-attempt { margin-block: .6rem; background: color-mix(in srgb, CanvasText 4%, Canvas); }
+  .flow-caption { margin-block: .5rem; font-size: .875rem; }
+  .flow-anchor { display: block; scroll-margin-top: 1rem; }
+  .flow-list { list-style: none; display: grid; gap: .45rem; padding: 0; margin: .6rem 0; }
+  .flow-step { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) minmax(0, 1.6fr);
+    gap: .25rem .65rem; align-items: stretch; padding: .45rem; border-bottom: 1px solid color-mix(in srgb, CanvasText 18%, Canvas); }
+  .flow-actor { padding: .42rem .55rem; border-radius: .3rem; border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas);
+    background: Canvas; overflow-wrap: anywhere; }
+  .flow-actor small { display: block; font-size: .75rem; }
+  .flow-actor p { margin: .2rem 0 0; font-size: .875rem; }
+  .flow-transfer { align-self: center; display: grid; gap: .25rem; text-align: center;
+    font-size: .875rem; overflow-wrap: anywhere; }
+  .flow-transfer::after { content: ""; width: 100%; height: 9px; background: LinkText;
+    clip-path: polygon(0 40%, calc(100% - 8px) 40%, calc(100% - 8px) 0, 100% 50%,
+      calc(100% - 8px) 100%, calc(100% - 8px) 60%, 0 60%); }
+  .flow-proof { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: .2rem .75rem; font-size: .78rem; }
+  .flow-file { overflow-wrap: anywhere; }
+  .flow-proof .flow-state { font-weight: 650; }
+  .flow-step[data-state="failed"] .flow-actor { border-color: #d26052; }
+  .flow-step[data-state="skipped"] .flow-actor { border-style: dashed; }
+  @media (max-width: 36rem) {
+    .flow-step { grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr) minmax(0, 1.25fr); gap: .3rem; }
+    .flow-actor { padding: .3rem; }
+    .flow-actor strong, .flow-actor p, .flow-transfer { font-size: .78rem; }
+  }
   @media (max-width: 30rem) { body { padding: .85rem; } dl { display: block; } dd { margin-bottom: .45rem; } }
 """
 
@@ -279,14 +308,15 @@ def _timeline_entry(event: Mapping[str, Any]) -> Mapping[str, Any]:
     if event.get("type") != "control_checkpoint":
         return event
     payload = _mapping(event.get("payload"))
-    inbox = _mapping(payload.get("inbox"))
+    router = _mapping(payload.get("router"))
+    inbox = _mapping(payload.get("inbox", router.get("inboxes")))
     return {
         "seq": event.get("seq"),
         "at": event.get("at"),
         "type": "control_checkpoint",
         "payload": {
-            "task_count": len(_mapping(payload.get("tasks"))),
-            "proposal_count": len(_mapping(payload.get("proposals"))),
+            "task_count": len(_mapping(payload.get("tasks", _mapping(payload.get("dispatcher")).get("tasks")))),
+            "proposal_count": len(_mapping(payload.get("proposals", router.get("proposals")))),
             "inbox_message_count": sum(len(messages) for messages in inbox.values() if isinstance(messages, list)),
         },
     }
@@ -309,10 +339,14 @@ def _event_title(event: Mapping[str, Any]) -> str:
     return " · ".join(piece for piece in pieces if piece) or "事件"
 
 
-def _details(title: str, data: Any, links: list[dict[str, Any]] | None = None, body: str = "") -> str:
+def _details(
+    title: str, data: Any, links: list[dict[str, Any]] | None = None, body: str = "",
+    *, anchor: str | None = None,
+) -> str:
+    attributes = f' id="{escape(anchor, quote=True)}" class="timeline-event"' if anchor else ""
     return (
         f"<details><summary>{escape(title)}</summary>{body}"
-        f"{_evidence_list(links) if links else ''}<pre>{escape(_pretty(data))}</pre></details>"
+        f"{_evidence_list(links) if links else ''}<pre{attributes}>{escape(_pretty(data))}</pre></details>"
     )
 
 
@@ -370,7 +404,113 @@ def _html_decision(row: Mapping[str, Any], summary: dict[str, Any]) -> str:
     quality = "".join(f"<p>{escape(line)}</p>" for line in _quality_text(row))
     values = _measurement_rows(row, summary["baseline"])
     table = _html_table(_MEASUREMENT_COLUMNS, values) if values else ""
-    return _details(f"候选 {candidate} · {action}", row, _evidence_for(row, summary["evidence"]), reason + quality + table)
+    target = next((f"validation-task-{number}-attempt-{position}"
+                   for number, graph in enumerate(summary["validation_graphs"], 1)
+                   for position, attempt in enumerate(graph["attempts"], 1)
+                   if attempt["candidate_id"] == candidate and attempt.get("primary")), None)
+    jump = f'<p><a href="#{target}">查看该候选的验证交接图</a></p>' if target else ""
+    return _details(f"候选 {candidate} · {action}", row, _evidence_for(row, summary["evidence"]), jump + reason + quality + table)
+
+
+_FLOW_STATES = {
+    "requested": "已发出", "succeeded": "已完成", "recorded": "有记录",
+    "failed": "失败", "skipped": "跳过", "running": "正在执行", "ok": "完成",
+    "blocked": "被阻断", "partial": "记录不完整", "interrupted": "中断",
+    "cleanup_pending": "清理待确认", "cancelled": "已取消",
+}
+_FLOW_ORIGINS = {"event": "会话事件", "instrumented": "执行记录", "reconstructed": "证据还原"}
+_FLOW_SCOPES = {"evaluation": "本次评测", "candidate": "候选", "parent": "父版", "revision": "被测版本",
+                "kernel": "算子", "forward": "模型 forward", "profile": "采集目标"}
+_FLOW_OPERATIONS = {
+    "save_contract": "封存工作点、参考结果与评测规则",
+    "probe": "探测目标环境与可用能力", "probe_identity": "核对设备、rank 与环境身份",
+    "prepare": "准备指定版本的独立工作区", "launch": "启动实例并返回加载状态",
+    "instance_identity": "核对实际加载的版本、组合与工作点", "reference": "取冻结参考输出",
+    "observe_outputs": "运行固定样例并返回逐项输出", "correctness": "核对输出及容差",
+    "device_timer": "记录算子设备计时", "device_timing_summary": "校验并汇总设备样本",
+    "forward_timer": "记录模型 forward 计时", "forward_timing_summary": "校验并汇总 forward 样本",
+    "benchmark_sample": "按固定请求执行一个计时轮次", "validate_sample": "校验样本归属、工作点和 token 数",
+    "measurement_summary": "汇总吞吐、TTFT 和 TPOT", "collect_profile": "采集各 rank 的时间线",
+    "parse_profile": "核对 rank 并归并热点", "cleanup": "关停实例并确认资源释放",
+    "paired_comparison": "核对口径并比较候选、父版与原始基线", "decision": "保存本次评测状态与原因",
+}
+_FLOW_REPLIES = {
+    "save_contract": "取得已保存评测约定的引用", "probe": "取得实际环境并准备核对身份",
+    "probe_identity": "接收环境比对结论", "prepare": "取得已准备的工作区", "launch": "取得启动凭据",
+    "instance_identity": "记录加载身份的核对结果", "observe_outputs": "取得逐项输出，交正确性校验",
+    "correctness": "依据校验结论决定是否继续测量", "device_timer": "取得设备计时样本",
+    "device_timing_summary": "收取设备计时汇总", "forward_timer": "取得 forward 计时样本",
+    "forward_timing_summary": "收取 forward 计时汇总", "benchmark_sample": "取得逐请求记录，校验该轮样本",
+    "validate_sample": "接收该轮样本的校验结论", "measurement_summary": "收取指标汇总",
+    "collect_profile": "取得采集结果，交 trace 解析", "parse_profile": "收取各 rank 的解析结论",
+    "cleanup": "根据回执确认实例和资源是否释放", "paired_comparison": "接收候选与比较版本的结果",
+    "decision": "取得评测状态记录的引用",
+}
+
+
+def _flow_reference(ref: Mapping[str, Any], index: dict[tuple[str, str], dict[str, Any]]) -> str:
+    path = _h(ref.get("path"))
+    entry = index.get(_reference_key(ref)) if isinstance(ref.get("path"), str) else None
+    if entry and entry.get("link_state") == "available" and entry.get("href"):
+        return f'<a class="flow-file" href="{escape(entry["href"], quote=True)}">{path}</a>'
+    state = entry.get("link_state") if entry else "missing"
+    return f'<span class="flow-file">{path} · {_h(state)}</span>'
+
+
+def _flow_steps(rows: list[dict[str, Any]], index: dict[tuple[str, str], dict[str, Any]]) -> str:
+    items = []
+    for row in rows:
+        state_name = row["state"]
+        state = _h(_FLOW_STATES.get(state_name, state_name))
+        origin = _h(_FLOW_ORIGINS.get(row["origin"], row["origin"]))
+        operation_key = row["operation"]
+        operation = _FLOW_OPERATIONS.get(operation_key, operation_key)
+        if row["origin"] == "instrumented" and state_name in {"succeeded", "failed"}:
+            operation = _FLOW_REPLIES.get(operation_key, operation)
+        if state_name == "skipped":
+            operation = "该步骤未执行，按本次状态继续收尾"
+        operation = _h(operation)
+        event = row.get("event_seq")
+        trace = f'<a href="#event-{event}">事件 #{event}</a>' if type(event) is int else ""
+        evidence = "".join(_flow_reference(ref, index) for ref in row.get("evidence", []))
+        scope_label = _FLOW_SCOPES.get(row.get("scope"))
+        scope = f"<span>{escape(scope_label)}</span>" if scope_label else ""
+        items.append(
+            f'<li class="flow-step" data-state="{_h(state_name)}">'
+            f'<div class="flow-actor"><small>发出</small><strong>{_h(row["sender"])}</strong></div>'
+            f'<div class="flow-transfer">{_h(row["message"])}</div>'
+            f'<div class="flow-actor"><small>接收</small><strong>{_h(row["receiver"])}</strong><p>{operation}</p></div>'
+            f'<div class="flow-proof"><span class="flow-state">{state}</span><span>{origin}</span>{scope}{trace}{evidence}</div></li>'
+        )
+    return f'<ol class="flow-list" role="list">{"".join(items)}</ol>' if items else ""
+
+
+def _validation_section(summary: dict[str, Any]) -> str:
+    index = {_reference_key(ref): ref for ref in summary["evidence"]}
+    tasks = []
+    for number, graph in enumerate(summary["validation_graphs"], 1):
+        title = f'{graph["title"]} · {graph["task_id"]}'
+        if graph["status"]:
+            title += f' · {_FLOW_STATES.get(graph["status"], graph["status"])}'
+        attempts = []
+        for position, attempt in enumerate(graph["attempts"], 1):
+            origin = _FLOW_ORIGINS[attempt["origin"]]
+            trace = (f'<p class="flow-caption">{_flow_reference(attempt["trace"], index)}</p>'
+                     if attempt["trace"] else "")
+            attempts.append(
+                f'<details class="flow-attempt"><summary>{_h(attempt["label"])} · {_h(attempt["attempt_id"])}'
+                f' · {_h(origin)}</summary><span class="flow-anchor" id="validation-task-{number}-attempt-{position}"></span>'
+                f'{trace}'
+                f'{_flow_steps(attempt["steps"] + attempt["after"], index) or "<p>暂无已记录的交接。</p>"}</details>'
+            )
+        reason = f'<p class="flow-caption">记录原因 · {_h(graph["reason"])}</p>' if graph["reason"] else ""
+        tasks.append(
+            f'<details class="validation-task" id="validation-task-{number}"><summary>{_h(title)}</summary>'
+            f'{reason}{_flow_steps(graph["first"], index)}'
+            f'{"".join(attempts) or "<p>本任务无可展示的评测尝试。</p>"}'
+            f'{_flow_steps(graph["last"], index)}</details>'
+        )
+    return "".join(tasks) or "<p>尚无验证任务。</p>"
 
 
 def _report_html(summary: dict[str, Any]) -> str:
@@ -379,6 +519,7 @@ def _report_html(summary: dict[str, Any]) -> str:
     labels = "".join(f"<dt>{escape(name)}</dt><dd>{_h(value)}</dd>" for name, value in heading)
     sections = {
         "overview": "运行范围",
+        "validation": "验证交接图",
         "decisions": "候选验收",
         "profiles": "采集与扫描",
         "timeline": "执行时间线",
@@ -399,7 +540,8 @@ def _report_html(summary: dict[str, Any]) -> str:
         _details(f"整栈复测 {index}", row, _evidence_for(row, evidence))
         for index, row in enumerate(summary["stack_validations"], 1)
     )
-    events = "".join(_details(_event_title(event), event) for event in summary["timeline"])
+    events = "".join(_details(_event_title(event), event, anchor=f"event-{event['seq']}")
+                     for event in summary["timeline"])
     baseline = _details(
         "原始基线的测量与证据", summary["baseline"], _evidence_for(summary["baseline"], evidence)
     )
@@ -415,6 +557,9 @@ def _report_html(summary: dict[str, Any]) -> str:
 <section id="overview"><h2>运行范围</h2><dl>{labels}</dl>{baseline}
 {_details("任务及评测规则", summary["scope"])}
 {_details("贡献来源", summary["contributions"])}</section>
+<section id="validation"><h2>验证交接图</h2>
+<p>箭头上是发送的内容，接收侧写明执行操作。每条边标出会话事件、执行记录或证据还原。</p>
+{_validation_section(summary)}</section>
 <section id="decisions"><h2>候选验收</h2>
 {_html_table(_DECISION_COLUMNS, rows) if rows else '<p>尚无候选裁决</p>'}
 {decisions}</section>
@@ -458,6 +603,7 @@ def _report_markdown(summary: dict[str, Any]) -> str:
     lines.extend(_md_details("原始基线的测量与证据", summary["baseline"]))
     lines.extend(_md_details("任务及评测规则", summary["scope"]))
     lines.extend(_md_details("贡献来源", summary["contributions"]))
+    lines.extend(["## 验证交接图", "", "[在 HTML 中逐次查看发送方、接收方和证据](report.html#validation)", ""])
     lines.extend(["## 候选验收", ""])
     decisions = summary["decisions"]
     if decisions:
@@ -507,6 +653,13 @@ def write_report(
     timeline = [_timeline_entry(event) for event in raw_events]
     scope = {key: manifest[key] for key in ("task", "target", "created_at", "fingerprint") if key in manifest}
     scope["runtime"] = state.get("runtime") or manifest.get("runtime")
+    reproductions = _reproduction_receipts(root, manifest)
+    evidence = _index_entries(root, index, state, raw_events, reproductions)
+    entries = {_reference_key(ref): ref for ref in evidence}
+
+    def read_graph_evidence(ref: Mapping[str, Any]) -> dict[str, Any] | None:
+        return _read_graph_evidence(root, entries, ref)
+
     summary = {
         "schema_version": 1,
         "session_id": manifest.get("session_id", root.name),
@@ -523,7 +676,9 @@ def write_report(
         "sweeps": _records(state.get("sweeps")),
         "stack_validations": _records(state.get("stack_validations")),
         "timeline": timeline,
-        "evidence": _index_entries(root, index, state, raw_events),
+        "evidence": evidence,
+        "validation_graphs": build_validation_graphs(state, raw_events, read_graph_evidence)
+        + build_reproduction_graphs(reproductions, read_graph_evidence),
         "stop_reason": state.get("stop_reason"),
         "report_warnings": warnings,
     }
@@ -531,3 +686,57 @@ def write_report(
     atomic_write(root / "report.html", _report_html(summary).encode("utf-8"))
     atomic_write(root / "summary.json", json_bytes(summary))
     return summary
+
+
+def _reproduction_receipts(root: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    folder = root / "evidence" / "reproductions"
+    if not manifest.get("fingerprint") or not folder.resolve().is_relative_to(root):
+        return []
+    receipts = []
+    for item in sorted(folder.glob("reproduce-*.json"), key=lambda path: path.name):
+        if not re.fullmatch(r"reproduce-[0-9a-f]{12}\.json", item.name):
+            continue
+        relative = f"evidence/reproductions/{item.name}"
+        local, _ = _local_file(root, relative)
+        if local is None:
+            continue
+        try:
+            raw = local.read_bytes()
+            data = _mapping(json.loads(raw))
+            json_bytes(data)
+        except (OSError, UnicodeError, ValueError):
+            continue
+        result = _mapping(data.get("result"))
+        if (
+            data.get("session_fingerprint") == manifest["fingerprint"]
+            and result.get("attempt_id") == item.stem and result.get("mode") == manifest.get("mode")
+        ):
+            digest = hashlib.sha256(raw).hexdigest()
+            receipts.append({"result": result, "reference": {
+                "path": relative, "sha256": digest, "producer": "independent_reproduction",
+            }})
+    return receipts
+
+
+def _read_graph_evidence(
+    root: Path, entries: dict[tuple[str, str], dict[str, Any]], reference: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    path = reference.get("path")
+    digest = reference.get("sha256")
+    if not isinstance(path, str) or not isinstance(digest, str):
+        return None
+    entry = entries.get(_reference_key(reference))
+    if not entry or entry["link_state"] != "available":
+        return None
+    local, _ = _local_file(root, path)
+    if not local:
+        return None
+    try:
+        raw = local.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != digest:
+            return None
+        data = json.loads(raw)
+        json_bytes(data)
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None

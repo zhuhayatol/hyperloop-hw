@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import median
 from typing import Any, Callable, Iterator, Mapping
@@ -24,7 +24,50 @@ from .measurements import (
 )
 
 Record = dict[str, Any]
-Operation = Callable[[AttemptEvidence, Record, Record], None]
+
+
+@dataclass
+class _TraceResponse:
+    message: str
+    state: str = "succeeded"
+
+
+class _ValidationAttempt(AttemptEvidence):
+    def __init__(self, root: Path, attempt_id: str) -> None:
+        super().__init__(root, attempt_id)
+        self.steps: list[Record] = []
+
+    def step(
+        self, sender: str, receiver: str, operation: str, scope: str, message: str, state: str,
+        *evidence_keys: str,
+    ) -> None:
+        row = {"sender": sender, "receiver": receiver, "operation": operation, "scope": scope,
+               "message": message, "state": state}
+        keys = [key for key in dict.fromkeys(evidence_keys) if key in self.records]
+        if keys:
+            row["evidence_keys"] = keys
+        self.steps.append(row)
+
+    @contextmanager
+    def exchange(
+        self, sender: str, receiver: str, operation: str, scope: str, request: str, response: str,
+        *evidence_keys: str,
+    ) -> Iterator[_TraceResponse]:
+        self.step(sender, receiver, operation, scope, request, "requested", *evidence_keys)
+        before = len(self.records)
+        receipt = _TraceResponse(response)
+        try:
+            yield receipt
+        except (BackendError, EvidenceProblem) as exc:
+            reason = exc.reason if isinstance(exc, EvidenceProblem) else "backend_failure"
+            self.step(receiver, sender, operation, scope, f"执行未完成（{reason}）", "failed",
+                      *evidence_keys, *list(self.records)[before:])
+            raise
+        self.step(receiver, sender, operation, scope, receipt.message, receipt.state,
+                  *evidence_keys, *list(self.records)[before:])
+
+
+Operation = Callable[[_ValidationAttempt, Record, Record], None]
 
 
 def _positive_outcome(result: Record, reason: str = "evaluation_complete") -> None:
@@ -70,12 +113,14 @@ class Evaluator:
         trusted = self._freeze_reference(reference, frozen)
         rules = EvaluationPolicy.load(policy)
 
-        def operation(attempt: AttemptEvidence, context: Record, result: Record) -> None:
+        def operation(attempt: _ValidationAttempt, context: Record, result: Record) -> None:
             with self._service(attempt, context, revision, "revision", "framework", expected_stack) as instance:
                 result["runtime"] = instance
                 verified = self._verify(attempt, context, instance, trusted, rules, "revision", "service")
                 result["correctness"] = verified
                 if not verified["pass"]:
+                    attempt.step("Evaluator", "BenchmarkRunner", "benchmark_sample", "revision",
+                                 "输出校验未通过，跳过端到端计时", "skipped", "revision_service_correctness")
                     _failed_correctness(result, "service_correctness_failed")
                     result["version_action"] = "HOLD"
                     return
@@ -99,7 +144,7 @@ class Evaluator:
         trusted = self._freeze_reference(reference, frozen)
         rules = EvaluationPolicy.load(policy)
 
-        def operation(attempt: AttemptEvidence, context: Record, result: Record) -> None:
+        def operation(attempt: _ValidationAttempt, context: Record, result: Record) -> None:
             with self._service(attempt, context, revision, "kernel", "kernel", expected_stack) as instance:
                 result["runtime"] = instance
                 if not self._check_kernel(attempt, context, instance, trusted, rules, result):
@@ -123,26 +168,33 @@ class Evaluator:
         trusted = self._freeze_reference(reference, frozen)
         rules = EvaluationPolicy.load(policy)
 
-        def operation(attempt: AttemptEvidence, context: Record, result: Record) -> None:
+        def operation(attempt: _ValidationAttempt, context: Record, result: Record) -> None:
             with self._service(attempt, context, revision, "forward", "model_forward", expected_stack) as instance:
                 verified = self._verify(attempt, context, instance, trusted, rules, "forward", "service")
                 result["correctness"] = verified
                 if not verified["pass"]:
+                    attempt.step("Evaluator", "RuntimeBackend", "forward_timer", "forward",
+                                 "输出校验未通过，跳过模型 forward 计时", "skipped", "forward_service_correctness")
                     _failed_correctness(result, "forward_correctness_failed")
                     result["version_action"] = "HOLD"
                     return
-                raw = self.backend.forward_timer(copy.deepcopy(instance), copy.deepcopy(frozen))
-                attempt.save("forward_raw", raw, "model_timer")
-                self._assert_observation(raw, instance, context)
-                samples = raw.get("samples_ms")
-                if (
-                    raw.get("boundary") != "model_forward" or not isinstance(samples, list)
-                    or not samples or not all(numeric(item) and item > 0 for item in samples)
-                ):
-                    raise EvidenceProblem("invalid_forward_timing", "incomparable")
-                timing = {"boundary": "model_forward", "samples_ms": samples, "median_ms": median(samples)}
-                result["forward_timing"] = timing
-                attempt.save("forward_timing", timing, "evaluation")
+                with attempt.exchange("Evaluator", "RuntimeBackend", "forward_timer", "forward",
+                                      "按模型 forward 边界请求计时", "返回模型 forward 原始样本",
+                                      "forward_service_correctness"):
+                    raw = self.backend.forward_timer(copy.deepcopy(instance), copy.deepcopy(frozen))
+                    attempt.save("forward_raw", raw, "model_timer")
+                with attempt.exchange("Evaluator", "BenchmarkRunner", "forward_timing_summary", "forward",
+                                      "核对 forward 计时边界和来源", "返回模型 forward 计时汇总", "forward_raw"):
+                    self._assert_observation(raw, instance, context)
+                    samples = raw.get("samples_ms")
+                    if (
+                        raw.get("boundary") != "model_forward" or not isinstance(samples, list)
+                        or not samples or not all(numeric(item) and item > 0 for item in samples)
+                    ):
+                        raise EvidenceProblem("invalid_forward_timing", "incomparable")
+                    timing = {"boundary": "model_forward", "samples_ms": samples, "median_ms": median(samples)}
+                    result["forward_timing"] = timing
+                    attempt.save("forward_timing", timing, "evaluation")
             _positive_outcome(result, "forward_evaluation_complete")
 
         return self._run(frozen, attempt_id, {"verify", "forward"}, operation, rules, trusted)
@@ -173,14 +225,24 @@ class Evaluator:
         if kind == "kernel":
             required.add("kernel")
 
-        def operation(attempt: AttemptEvidence, context: Record, result: Record) -> None:
+        def operation(attempt: _ValidationAttempt, context: Record, result: Record) -> None:
             with self._service(attempt, context, revision, "candidate", kind, expected_stack) as instance:
                 result["runtime"] = instance
                 if kind == "kernel" and not self._check_kernel(attempt, context, instance, trusted_kernel, rules, result):
+                    attempt.step("Evaluator", "Verifier", "correctness", "candidate",
+                                 "算子校验未通过，跳过候选服务校验", "skipped", "operator_kernel_correctness")
+                    attempt.step("Evaluator", "BenchmarkRunner", "benchmark_sample", "candidate",
+                                 "算子校验未通过，跳过端到端计时", "skipped", "operator_kernel_correctness")
+                    attempt.step("Evaluator", "RuntimeBackend", "prepare", "parent",
+                                 "候选未通过校验，跳过父版本配对", "skipped", "operator_kernel_correctness")
                     return
                 verified = self._verify(attempt, context, instance, trusted, rules, "candidate", "service")
                 result["correctness"] = verified
                 if not verified["pass"]:
+                    attempt.step("Evaluator", "BenchmarkRunner", "benchmark_sample", "candidate",
+                                 "输出校验未通过，跳过端到端计时", "skipped", "candidate_service_correctness")
+                    attempt.step("Evaluator", "RuntimeBackend", "prepare", "parent",
+                                 "候选未通过校验，跳过父版本配对", "skipped", "candidate_service_correctness")
                     _failed_correctness(result, "service_correctness_failed")
                     return
                 result["measurement"] = self._measure(attempt, context, instance, rules, "candidate")
@@ -189,9 +251,14 @@ class Evaluator:
                 verified = self._verify(attempt, context, instance, trusted, rules, "parent", "service")
                 result["parent_correctness"] = verified
                 if not verified["pass"]:
+                    attempt.step("Evaluator", "BenchmarkRunner", "benchmark_sample", "parent",
+                                 "父版本输出校验未通过，跳过端到端计时", "skipped", "parent_service_correctness")
                     raise EvidenceProblem("parent_correctness_failed", "incomparable")
                 result["parent_measurement"] = self._measure(attempt, context, instance, rules, "parent")
-            self._decision(attempt, result, baseline, rules)
+            with attempt.exchange("Evaluator", "DecisionGate", "paired_comparison", "evaluation",
+                                  "按锁定门槛比较候选、父版本和原始基线", "返回版本比较和评测结果",
+                                  "candidate_measurement", "parent_measurement", "policy"):
+                self._decision(attempt, result, baseline, rules)
 
         return self._run(frozen, attempt_id, required, operation, rules, trusted)
 
@@ -206,13 +273,17 @@ class Evaluator:
         """Capture and parse a separate raw trace for every expected rank."""
         frozen = copy.deepcopy(dict(workload))
 
-        def operation(attempt: AttemptEvidence, context: Record, result: Record) -> None:
+        def operation(attempt: _ValidationAttempt, context: Record, result: Record) -> None:
             with self._service(attempt, context, revision, "profile", "framework", expected_stack) as instance:
                 result["runtime"] = instance
-                raw = self.backend.collect_profile(copy.deepcopy(instance), copy.deepcopy(frozen))
-                attempt.save("profile_raw", raw, "profiler")
-                self._assert_observation(raw, instance, context)
-                self._parse_profile(attempt, context, revision, raw, result)
+                with attempt.exchange("Profiler", "RuntimeBackend", "collect_profile", "profile",
+                                      "采集已加载版本的各 rank trace", "返回原始 Profile 响应", "profile_launch"):
+                    raw = self.backend.collect_profile(copy.deepcopy(instance), copy.deepcopy(frozen))
+                    attempt.save("profile_raw", raw, "profiler")
+                with attempt.exchange("Evaluator", "TraceAnalyzer", "parse_profile", "profile",
+                                      "核对采集身份、窗口及各 rank trace", "返回各 rank 热点和定位依据", "profile_raw"):
+                    self._assert_observation(raw, instance, context)
+                    self._parse_profile(attempt, context, revision, raw, result)
             _positive_outcome(result, "profile_complete")
 
         return self._run(frozen, attempt_id, {"profile"}, operation)
@@ -239,20 +310,29 @@ class Evaluator:
     ) -> Record:
         requests = workload_requests(workload)
         workload_fingerprint = fingerprint(workload)
-        attempt = AttemptEvidence(self.workspace_root, attempt_id)
+        attempt = _ValidationAttempt(self.workspace_root, attempt_id)
         attempt.save("workload", workload, "evaluation")
         if rules is not None:
             attempt.save("policy", asdict(rules), "evaluation")
         if reference is not None:
             attempt.save("reference", reference, "evaluation")
+        attempt.step("Evaluator", "EvidenceStore", "save_contract", "evaluation", "保存本次评测约定", "succeeded",
+                     "workload", "policy", "reference")
         result: Record = {
             "attempt_id": attempt_id, "status": "failed", "evidence_state": "missing",
             "acceptance": "undetermined", "version_action": "HOLD", "reason": "no_evaluation",
         }
+        mode = None
         try:
-            probe = self.backend.probe()
-            attempt.save("probe", probe, "runtime_backend")
-            self._verify_probe(probe, required)
+            with attempt.exchange("Evaluator", "RuntimeBackend", "probe", "evaluation",
+                                  "探测目标设备、并行拓扑和可用能力", "返回运行环境探测记录"):
+                probe = self.backend.probe()
+                attempt.save("probe", probe, "runtime_backend")
+                if isinstance(probe, dict) and probe.get("mode") in {"simulated", "real"}:
+                    mode = probe["mode"]
+            with attempt.exchange("Evaluator", "Verifier", "probe_identity", "evaluation",
+                                  "核对环境指纹、rank 映射和本次所需能力", "环境预检通过", "probe", "workload"):
+                self._verify_probe(probe, required)
             result["mode"] = probe["mode"]
             context = {
                 "probe": probe, "mode": probe["mode"], "requests": requests, "workload": workload,
@@ -270,6 +350,12 @@ class Evaluator:
             result.update(status="failed", evidence_state="missing", reason="backend_failure")
         decision_fields = ("status", "evidence_state", "acceptance", "version_action", "reason", "comparison")
         attempt.save("decision", {name: result[name] for name in decision_fields if name in result}, "evaluation")
+        action = result["version_action"]
+        reason = result["reason"]
+        attempt.step("Evaluator", "EvidenceStore", "decision", "evaluation", f"记录评测结论 {action}（{reason}）",
+                     "succeeded", "decision", "paired_comparison", "backend_failure")
+        attempt.save("validation_flow", {"schema_version": 1, "attempt_id": attempt_id, "mode": mode,
+                                         "steps": attempt.steps}, "evaluation_trace")
         result["evidence"] = copy.deepcopy(attempt.records)
         return result
 
@@ -303,29 +389,44 @@ class Evaluator:
     @contextmanager
     def _service(
         self,
-        attempt: AttemptEvidence,
+        attempt: _ValidationAttempt,
         context: Record,
         revision: str,
         label: str,
         kind: str,
         expected_stack: Mapping[str, Any] | None,
     ) -> Iterator[Record]:
-        prepared = self.backend.prepare(revision, attempt.workspace(label), kind=kind)
+        prepared_key = f"{label}_prepared"
+        launch_key = f"{label}_launch"
+        attempt.step("Evaluator", "RuntimeBackend", "prepare", label, "在本次评测的隔离目录准备版本",
+                     "requested", "probe")
+        try:
+            prepared = self.backend.prepare(revision, attempt.workspace(label), kind=kind)
+        except BackendError:
+            attempt.step("RuntimeBackend", "Evaluator", "prepare", label, "后端未能准备隔离版本", "failed", "probe")
+            raise
         instance = None
         try:
-            attempt.save(f"{label}_prepared", prepared, "runtime_backend")
-            instance = self.backend.launch(copy.deepcopy(prepared), copy.deepcopy(context["workload"]))
-            attempt.save(f"{label}_launch", instance, "runtime_backend")
-            self._assert_instance(instance, context, revision, expected_stack)
+            attempt.save(prepared_key, prepared, "runtime_backend")
+            attempt.step("RuntimeBackend", "Evaluator", "prepare", label, "返回构建准备记录", "succeeded", prepared_key)
+            with attempt.exchange("Evaluator", "RuntimeBackend", "launch", label,
+                                  "按锁定负载启动已准备的版本", "返回服务启动记录", prepared_key, "workload"):
+                instance = self.backend.launch(copy.deepcopy(prepared), copy.deepcopy(context["workload"]))
+                attempt.save(launch_key, instance, "runtime_backend")
+            with attempt.exchange("Evaluator", "Verifier", "instance_identity", label,
+                                  "核对实际加载版本、执行栈和 rank 映射", "运行实例身份核对通过", launch_key, "probe"):
+                self._assert_instance(instance, context, revision, expected_stack)
             yield instance
         finally:
-            try:
-                cleanup = self.backend.cleanup(copy.deepcopy(prepared), copy.deepcopy(instance))
-            except BackendError as exc:
-                cleanup = {"released": False, "reason": str(exc)}
-            attempt.save(f"{label}_cleanup", cleanup, "runtime_backend")
-            if not isinstance(cleanup, dict) or cleanup.get("released") is not True:
-                raise EvidenceProblem("cleanup_unconfirmed", "missing", "blocked")
+            with attempt.exchange("Evaluator", "RuntimeBackend", "cleanup", label,
+                                  "清理本次隔离实例和资源", "确认本次资源已释放", prepared_key, launch_key):
+                try:
+                    cleanup = self.backend.cleanup(copy.deepcopy(prepared), copy.deepcopy(instance))
+                except BackendError as exc:
+                    cleanup = {"released": False, "reason": str(exc)}
+                attempt.save(f"{label}_cleanup", cleanup, "runtime_backend")
+                if not isinstance(cleanup, dict) or cleanup.get("released") is not True:
+                    raise EvidenceProblem("cleanup_unconfirmed", "missing", "blocked")
 
     @staticmethod
     def _assert_instance(
@@ -360,7 +461,7 @@ class Evaluator:
 
     def _verify(
         self,
-        attempt: AttemptEvidence,
+        attempt: _ValidationAttempt,
         context: Record,
         instance: Record,
         reference: Mapping[str, list[float]],
@@ -368,19 +469,33 @@ class Evaluator:
         label: str,
         scope: str,
     ) -> Record:
-        raw = self.backend.observe_outputs(copy.deepcopy(instance), copy.deepcopy(context["workload"]), scope=scope)
-        attempt.save(f"{label}_{scope}_outputs", raw, "runtime_backend")
-        self._assert_observation(raw, instance, context)
-        if raw.get("scope") != scope:
-            raise EvidenceProblem("correctness_scope_mismatch", "incomparable")
-        verified = correctness(raw, context["requests"], reference, rules.tolerance,
-                               context["workload"].get("dtype", "float32"))
-        attempt.save(f"{label}_{scope}_correctness", verified, "verifier")
+        step_scope = "kernel" if scope == "kernel" else label
+        boundary = "算子" if scope == "kernel" else "服务"
+        output_key = f"{label}_{scope}_outputs"
+        reference_key = "kernel_reference" if scope == "kernel" else "reference"
+        with attempt.exchange("Evaluator", "RuntimeBackend", "observe_outputs", step_scope,
+                              f"按锁定输入请求{boundary}输出", f"返回{boundary}原始输出", "workload"):
+            raw = self.backend.observe_outputs(copy.deepcopy(instance), copy.deepcopy(context["workload"]), scope=scope)
+            attempt.save(output_key, raw, "runtime_backend")
+        attempt.step("Evaluator", "Verifier", "reference", step_scope, f"交付预先固化的{boundary}参考输出",
+                     "succeeded", reference_key)
+        with attempt.exchange("Evaluator", "Verifier", "correctness", step_scope,
+                              f"核对{boundary}输出来源并按锁定容差独立比对", f"{boundary}正确性校验通过",
+                              output_key, reference_key, "policy") as receipt:
+            self._assert_observation(raw, instance, context)
+            if raw.get("scope") != scope:
+                raise EvidenceProblem("correctness_scope_mismatch", "incomparable")
+            verified = correctness(raw, context["requests"], reference, rules.tolerance,
+                                   context["workload"].get("dtype", "float32"))
+            attempt.save(f"{label}_{scope}_correctness", verified, "verifier")
+            if not verified["pass"]:
+                receipt.state = "failed"
+                receipt.message = f"{boundary}正确性校验未通过"
         return verified
 
     def _check_kernel(
         self,
-        attempt: AttemptEvidence,
+        attempt: _ValidationAttempt,
         context: Record,
         instance: Record,
         reference: Mapping[str, list[float]],
@@ -390,40 +505,56 @@ class Evaluator:
         attempt.save("kernel_reference", reference, "evaluation")
         result["kernel_correctness"] = self._verify(attempt, context, instance, reference, rules, "operator", "kernel")
         if not result["kernel_correctness"]["pass"]:
+            attempt.step("Evaluator", "RuntimeBackend", "device_timer", "kernel",
+                         "算子校验未通过，跳过设备计时", "skipped", "operator_kernel_correctness")
             _failed_correctness(result, "kernel_correctness_failed")
             return False
-        raw = self.backend.device_timer(copy.deepcopy(instance), copy.deepcopy(context["workload"]))
-        attempt.save("device_timing_raw", raw, "runtime_backend")
-        self._assert_observation(raw, instance, context)
-        samples = raw.get("samples_us")
-        if raw.get("boundary") != "kernel_device":
-            raise EvidenceProblem("device_timing_boundary_mismatch", "incomparable")
-        if not isinstance(samples, list) or not samples or any(not numeric(value) or value <= 0 for value in samples):
-            raise EvidenceProblem("device_timing_missing", "missing", "partial")
-        result["device_timing"] = {"boundary": "kernel_device", "samples_us": samples, "median_us": median(samples)}
-        attempt.save("device_timing", result["device_timing"], "evaluation")
+        with attempt.exchange("Evaluator", "RuntimeBackend", "device_timer", "kernel",
+                              "请求算子设备计时", "返回算子设备计时原始样本", "operator_kernel_correctness"):
+            raw = self.backend.device_timer(copy.deepcopy(instance), copy.deepcopy(context["workload"]))
+            attempt.save("device_timing_raw", raw, "runtime_backend")
+        with attempt.exchange("Evaluator", "BenchmarkRunner", "device_timing_summary", "kernel",
+                              "独立核对设备计时边界和来源", "返回设备计时汇总", "device_timing_raw"):
+            self._assert_observation(raw, instance, context)
+            samples = raw.get("samples_us")
+            if raw.get("boundary") != "kernel_device":
+                raise EvidenceProblem("device_timing_boundary_mismatch", "incomparable")
+            if not isinstance(samples, list) or not samples or any(not numeric(value) or value <= 0 for value in samples):
+                raise EvidenceProblem("device_timing_missing", "missing", "partial")
+            result["device_timing"] = {"boundary": "kernel_device", "samples_us": samples, "median_us": median(samples)}
+            attempt.save("device_timing", result["device_timing"], "evaluation")
         return True
 
     def _measure(
-        self, attempt: AttemptEvidence, context: Record, instance: Record, rules: EvaluationPolicy, label: str
+        self, attempt: _ValidationAttempt, context: Record, instance: Record, rules: EvaluationPolicy, label: str
     ) -> Record:
         samples = []
         for repeat in range(rules.repeats):
-            raw = self.backend.benchmark(copy.deepcopy(instance), copy.deepcopy(context["workload"]), repeat=repeat, warmup=rules.warmup)
-            attempt.save(f"{label}_repeat_{repeat}", raw, "runner")
-            if raw is None:
-                raise EvidenceProblem("timing_samples_missing", "missing", "partial")
-            self._assert_observation(raw, instance, context)
-            samples.append(benchmark_sample(raw, context["requests"], repeat, rules.warmup))
-        protocol = {"repeats": rules.repeats, "warmup": rules.warmup, "metrics": dict(METRIC_DEFINITIONS)}
-        measured = {
-            "mode": context["mode"], "revision": instance["loaded_revision"], "loaded_stack": instance["loaded_stack"],
-            "environment_fingerprint": context["environment_fingerprint"],
-            "workload_fingerprint": context["workload_fingerprint"], "boundary": "service_end_to_end",
-            "protocol": protocol, "protocol_fingerprint": fingerprint(protocol),
-            "samples": samples, "summary": summarize(samples),
-        }
-        attempt.save(f"{label}_measurement", measured, "evaluation")
+            raw_key = f"{label}_repeat_{repeat}"
+            with attempt.exchange("BenchmarkRunner", "RuntimeBackend", "benchmark_sample", label,
+                                  f"请求第 {repeat + 1} 轮独立端到端计时",
+                                  f"返回第 {repeat + 1} 轮端到端响应", "policy"):
+                raw = self.backend.benchmark(copy.deepcopy(instance), copy.deepcopy(context["workload"]),
+                                             repeat=repeat, warmup=rules.warmup)
+                attempt.save(raw_key, raw, "runner")
+            with attempt.exchange("Evaluator", "BenchmarkRunner", "validate_sample", label,
+                                  f"核对第 {repeat + 1} 轮样本及计时边界", f"第 {repeat + 1} 轮样本通过核对", raw_key):
+                if raw is None:
+                    raise EvidenceProblem("timing_samples_missing", "missing", "partial")
+                self._assert_observation(raw, instance, context)
+                samples.append(benchmark_sample(raw, context["requests"], repeat, rules.warmup))
+        with attempt.exchange("Evaluator", "BenchmarkRunner", "measurement_summary", label,
+                              "按锁定协议汇总端到端样本", "返回端到端测量汇总",
+                              *(f"{label}_repeat_{repeat}" for repeat in range(rules.repeats))):
+            protocol = {"repeats": rules.repeats, "warmup": rules.warmup, "metrics": dict(METRIC_DEFINITIONS)}
+            measured = {
+                "mode": context["mode"], "revision": instance["loaded_revision"], "loaded_stack": instance["loaded_stack"],
+                "environment_fingerprint": context["environment_fingerprint"],
+                "workload_fingerprint": context["workload_fingerprint"], "boundary": "service_end_to_end",
+                "protocol": protocol, "protocol_fingerprint": fingerprint(protocol),
+                "samples": samples, "summary": summarize(samples),
+            }
+            attempt.save(f"{label}_measurement", measured, "evaluation")
         return measured
 
     @staticmethod

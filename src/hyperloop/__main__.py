@@ -114,12 +114,14 @@ def _reproduce(args: argparse.Namespace) -> dict[str, Any]:
     evidence = result.get("evidence", {})
     return {
         "session": str(coordinator.store.path),
+        "validation_report": str(coordinator.store.path / "report.html") + "#validation",
         **{key: result[key] for key in fields if key in result},
         "evidence": {
             name: evidence[name]
-            for name in ("decision", "paired_comparison", "candidate_measurement", "parent_measurement")
+            for name in ("decision", "paired_comparison", "candidate_measurement", "parent_measurement", "validation_flow")
             if name in evidence
         },
+        "reproduction_receipt": result.get("reproduction_receipt"),
     }
 
 

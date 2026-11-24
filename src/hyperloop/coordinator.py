@@ -139,11 +139,20 @@ class Coordinator:
             if decision is None or not self.store.verify_evidence(proposal):
                 raise ContractError(f"candidate has no verified proposal record: {candidate_id}")
             spec = read_json(self.store.artifact_path(proposal["path"]))
+            attempt_id = f"reproduce-{uuid4().hex[:12]}"
             rerun = self.actions.evaluate_candidate(
-                spec, decision["parent_revision"], state["baseline"], f"reproduce-{uuid4().hex[:12]}", decision["kind"]
+                spec, decision["parent_revision"], state["baseline"], attempt_id, decision["kind"]
             )
             rerun = adjudicate(self.store, rerun, state["baseline"], self.task["rules"])
-            return {**rerun, "recorded_action": decision["version_action"], "mode": self.store.manifest["mode"]}
+            result = {**rerun, "attempt_id": attempt_id, "recorded_action": decision["version_action"],
+                      "mode": self.store.manifest["mode"]}
+            reference = self.store.put_evidence(
+                f"evidence/reproductions/{attempt_id}.json",
+                {"session_fingerprint": self.store.manifest["fingerprint"], "result": result},
+                producer="independent_reproduction",
+            )
+            self.report()
+            return {**result, "reproduction_receipt": reference}
 
     @property
     def phase(self) -> str:
