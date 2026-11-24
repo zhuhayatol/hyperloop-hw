@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hyperloop Agent 执行架构</title>
+<style>
+:root{color-scheme:light;--paper:#f5f7fa;--card:#fff;--ink:#142238;--mute:#47576c;--line:#cdd8e4;--route:#225382;--soft:#e8f2fa;--agent:#814a12;--agent-bg:#fbedd9;--judge:#36563b;--judge-bg:#e8f4e6;--fail:#8b3e34;--fail-bg:#faeeeb;--shadow:0 5px 20px #233b4e0b}
+@media(prefers-color-scheme:dark){:root{color-scheme:dark;--paper:#111b29;--card:#182638;--ink:#e6eef8;--mute:#b5c6da;--line:#3d536d;--route:#9ecbf4;--soft:#203750;--agent:#f5c487;--agent-bg:#3c2e25;--judge:#a5d39f;--judge-bg:#243a31;--fail:#f5a99f;--fail-bg:#462f35;--shadow:none}}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 system-ui,"Microsoft YaHei",sans-serif}
+main{max-width:1300px;margin:auto;padding:35px 28px 52px}h1{font-size:clamp(29px,4vw,51px);letter-spacing:-.025em;margin:3px 0 7px;line-height:1.2}h2{font-size:22px;margin:0}h3{font-size:16px;margin:0}p{margin:0}a{color:var(--route);text-underline-offset:3px}button{font:inherit;color:inherit}button:focus-visible,a:focus-visible{outline:3px solid var(--route);outline-offset:3px}
+.kicker{font-size:12px;letter-spacing:.14em;color:var(--route);font-weight:700}.intro{max-width:800px;color:var(--mute);margin-bottom:12px}.links{display:flex;gap:7px 20px;flex-wrap:wrap;font-size:13px;margin-bottom:20px}
+.tabs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}.tabs button,.detail-nav button{cursor:pointer;background:var(--card);border:1px solid var(--line);border-radius:7px;padding:8px 11px}.tabs button[aria-selected=true]{background:var(--soft);border-color:var(--route);font-weight:700;color:var(--route)}
+.stage{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;box-shadow:var(--shadow)}.stage-head p{color:var(--mute);font-size:14px;margin:4px 0 15px}
+.stage-link,.node{display:block;border:1px solid var(--line);border-radius:7px;background:var(--card);text-align:left;padding:10px 11px;cursor:pointer;min-width:0;width:100%}.stage-link:hover,.node:hover,.node[aria-pressed=true]{border-color:var(--route);background:var(--soft)}.stage-link strong,.node strong{display:block;font-size:14px;overflow-wrap:anywhere}.stage-link span,.node small{display:block;font-size:12px;color:var(--mute);margin-top:3px}
+.lanes{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:14px;align-items:start}.routes{display:grid;gap:8px}.flow{padding:9px 11px;border:1px solid var(--line);border-radius:8px}.flow h3{font-size:13px;color:var(--mute);font-weight:650;margin-bottom:6px}.edge{min-width:25px;align-self:center;color:var(--route);text-align:center;font-size:17px}.node .kind{font-size:10px;font-weight:700;margin:0 0 4px;color:var(--route)}.node[data-kind=Agent] .kind{color:var(--agent)}.node[data-kind=Agent] {border-left:3px solid var(--agent)}.node[data-kind=准入]{border-left:3px solid var(--judge)}.node[data-kind=证据]{border-left:3px solid var(--route)}
+.detail{background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:12px 14px;min-height:180px}.detail h3{font-size:17px;margin:0 0 6px}.detail p,.detail li{font-size:13px}.detail ul{padding-left:20px;margin:6px 0 9px}.detail a{font-size:12px;display:inline-block;margin-top:4px}.detail-nav{display:flex;flex-wrap:wrap;gap:4px;margin-top:7px}.detail-nav button{font-size:12px;padding:4px 7px}.meta-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:11px 0 0}.meta-grid article{border:1px solid var(--line);border-radius:8px;padding:11px 12px}.meta-grid p{font-size:13px;color:var(--mute);margin-top:4px}.example{margin-top:13px;display:grid;grid-template-columns:1fr 1fr;gap:10px}.example article{border:1px solid var(--line);background:var(--card);border-radius:8px;padding:10px 13px}.example p{font-size:13px;color:var(--mute);margin-top:3px}.example strong{color:var(--route)}.scope{font-size:12px;color:var(--mute);margin-top:13px}
+.detail{position:sticky;top:12px;scroll-margin-top:12px}
+.example[hidden] { display: none; }
+.validation-view { display: grid; gap: 19px; }
+.validation-view h3 { margin-bottom: 8px; }
+.validation-view section { min-width: 0; }
+.boundary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
+.boundary article { padding: 11px 12px; border: 1px solid var(--line); border-radius: 8px; }
+.boundary h4 { margin: 0 0 4px; font-size: 14px; }
+.boundary p, .target-note, .review-note { font-size: 13px; color: var(--mute); }
+.boundary article:nth-child(2) { background: var(--soft); }
+.target-note, .review-note { margin-top: 7px; }
+.review-controls { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.review-controls button { cursor: pointer; background: var(--card); border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; font-size: 13px; }
+.review-controls button[aria-pressed=true] { background: var(--soft); border-color: var(--route); color: var(--route); font-weight: 700; }
+.decision-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; margin: 0; }
+.decision-grid div { padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; }
+.decision-grid dt { font-size: 12px; color: var(--mute); }
+.decision-grid dd { margin: 3px 0 0; font-weight: 650; }
+.decision-grid [data-state=pass] { background: var(--judge-bg); color: var(--judge); }
+.decision-grid [data-state=fail] { background: var(--fail-bg); color: var(--fail); }
+.decision-grid [data-state=pending] { background: var(--agent-bg); color: var(--agent); }
+.scores { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; margin-top: 10px; table-layout: fixed; }
+.scores th, .scores td { padding: 6px 8px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.scores th { color: var(--mute); font-weight: 600; }
+.scores td:first-child { font-weight: 650; }
+.raw-chain { display: grid; gap: 5px; margin-top: 11px; }
+.raw-chain details { border: 1px solid var(--line); border-radius: 7px; background: var(--paper); min-width: 0; }
+.raw-chain summary { cursor: pointer; padding: 7px 10px; font-size: 13px; font-weight: 600; }
+.raw-chain pre { padding: 0 10px 8px; margin: 0; font: 12px/1.55 ui-monospace, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.raw-chain summary:focus-visible { outline: 3px solid var(--route); outline-offset: 2px; }
+.handoffs { display:grid; gap:5px; margin:0; padding:0; list-style:none; }
+.handoff, .handoff-head { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.8fr) minmax(0,1fr); align-items:stretch; gap:7px; }
+.handoff-head { padding:0 0 4px; color:var(--mute); font-size:11px; font-weight:650; }
+.handoff-head span:nth-child(2) { text-align:center; }
+.handoff .node { padding:7px 8px; }
+.handoff .node strong { font-size:13px; }
+.transfer { display:grid; align-content:center; justify-items:center; gap:3px; padding:5px 3px; color:var(--ink); font-size:12px; text-align:center; overflow-wrap:anywhere; }
+.transfer::after { content:""; width:min(100%,68px); height:6px; background:var(--route); clip-path:polygon(0 36%,calc(100% - 6px) 36%,calc(100% - 6px) 0,100% 50%,calc(100% - 6px) 100%,calc(100% - 6px) 64%,0 64%); }
+.route-entry { display:flex; flex-wrap:wrap; gap:5px 13px; margin:0 0 12px; font-size:13px; }
+.comparison { margin-bottom:13px; }
+.comparison .scores { margin:6px 0; }
+.comparison .scores th:first-child { width:14%; }
+.comparison .scores th { color:var(--ink); }
+.overview-flow { display:flex; flex-wrap:wrap; align-items:stretch; gap:7px; }
+.overview-flow .stage-link { width:auto; flex:1 1 115px; }
+.overview-flow .edge { min-width:15px; }
+@media(max-width:970px){.lanes{grid-template-columns:1fr}.detail{position:static;order:-1;min-height:auto}}@media(max-width:660px){main{padding:20px 12px}.stage{padding:13px 12px}.meta-grid,.example{grid-template-columns:1fr}.tabs button{padding:6px 8px;font-size:13px}}
+@media(max-width:660px){.boundary,.decision-grid{grid-template-columns:1fr}.scores th,.scores td{padding:5px 4px}.handoff,.handoff-head{grid-template-columns:minmax(0,1fr) minmax(0,1.35fr) minmax(0,1fr);gap:3px}.handoff .node{padding:5px 4px}.handoff .node strong,.transfer{font-size:12px}.comparison .scores th:first-child{width:18%}.overview-flow{flex-direction:column}.overview-flow .stage-link{width:100%;flex:auto}.overview-flow .edge{transform:rotate(90deg);line-height:1}}
+</style>
+<main>
+  <header>
+    <div class="kicker">通用底稿 · 设计稿</div>
+    <h1>Hyperloop Agent 执行架构</h1>
+    <p class="intro">沿阶段看谁把什么交给谁。上游页对应 Hyperloom 的调度与 Agent 交接。下层执行页沿同一任务走完昇腾上的启动、验证、计时和留证。</p>
+    <div class="links"><a href="源码架构参考.html#map">源码架构参考总图</a><a href="源码架构参考.html#journey">上游交接走读</a><a href="源码架构参考.html#arch-step-kernel-backend">Attention 双路线</a><a href="通用底稿初步规划.md">通用底稿规划</a></div>
+  </header>
+  <nav class="tabs" id="tabs" aria-label="架构视图"></nav>
+  <section class="stage" id="stage"></section>
+  <section class="example" id="walkthrough" aria-label="模拟两轮示例">
+    <article><h3>模拟第一轮 · 框架参数</h3><p>原始 100 → Explore 复测 110 → 独立验收 <strong>KEEP</strong>。达到上次采集锚点的 1.10 倍时再检查复采条件。</p></article>
+    <article><h3>模拟第二轮 · 算子补丁</h3><p>Forge 交补丁 → 服务复测 112 → 相对 110 为 +1.82%，低于示例门槛 2%，<strong>REVERT</strong>，接受版仍为 110。</p></article>
+  </section>
+  <p class="scope">依据本地 Hyperloom-main 1.1.5 快照及源码课。数值为走读示例。实现和双 910B2 验收待开展。</p>
+  <noscript>启用 JavaScript 可查看离线交互图，也可打开上方规划文档查看完整流程。</noscript>
+</main>
+<script>
+'use strict';
+const up='../Hyperloom-main/', src=up+'src/hyperloom/', docs=up+'docs/';
+const evidence={
+ loop:[docs+'conceptual/optimization-loop.md','上游阶段与工作流'],
+ prelude:[src+'orchestrator/phases/prelude.py#L1632','PRELUDE 基线后的采集与分析'],
+ coord:[src+'orchestrator/loop/coordinator.py#L646','Coordinator 主循环'],
+ dispatch:[src+'orchestrator/loop/dispatcher.py#L461','Dispatcher 资源与派发'],
+ reap:[src+'orchestrator/loop/dispatcher.py#L1042','Dispatcher 回收和回写交接'],
+ router:[src+'orchestrator/loop/intent_router.py#L551','Intent Router 正式提案与审查'],
+ delegate:[src+'orchestrator/loop/intent_router.py#L937','Intent Router 直接委派'],
+ policy:[src+'orchestrator/policy/gate.py#L412','PolicyGate 提案检查'],
+ baseline:[src+'orchestrator/actions/executors/baseline.py#L624','BaselineExecutor'],
+ profile:[src+'orchestrator/actions/executors/profile.py#L918','ProfileExecutor'],
+ explore:[src+'orchestrator/actions/executors/explore.py#L1258','Explore 候选试跑'],
+ specialist:[src+'orchestrator/specialists/dispatch.py#L920','Specialist 交付后的路由'],
+ frame:[src+'orchestrator/phases/framework.py#L1823','框架阶段收尾与复采'],
+ kernel:[docs+'reference/kernel-execution-path.md','上游 GEAK 与 Forge 执行契约'],
+ kphase:[src+'orchestrator/phases/kernel.py#L630','KernelPhase.run_agent'],
+ ktail:[src+'orchestrator/phases/kernel.py#L765','Forge 共用后续阶段'],
+ geak:[docs+'components/geak.md#L28','GEAK 服务与算子工作流'],
+ geakbench:[src+'orchestrator/phases/kernel_geak_promotion.py#L146','GEAK 候选复验'],
+ forge:[up+'src/kernelforge/workflows/rewrite_controller/controller.py#L290','Forge 控制器选点与派发'],
+ land:[src+'orchestrator/kernel/controller_patch_integration.py#L371','Forge 补丁集成与提交'],
+ rebench:[src+'orchestrator/kernel/request_handlers.py#L151','集成器启动同负载服务复测'],
+ sweep:[src+'orchestrator/phases/sweep.py#L73','SWEEP 入口与准入'],
+ sweepback:[src+'orchestrator/loop/_integrate_promotion.py#L398','扫描结果写回'],
+ phase:[src+'orchestrator/phases/machine_state.py#L1579','阶段机读取扫描结果'],
+ stack:[src+'orchestrator/loop/_resume_consistency.py#L108','终态整栈复测'],
+ close:[src+'orchestrator/phases/close.py#L168','CLOSE 任务与报告'],
+ breakdown:[docs+'reference/session-breakdown.md','Session 报告契约'],
+ design:['通用底稿初步规划.md','Hyperloop 规划']
+};
+const nodes={
+ start:['任务配置','输入','冻结模型和 tokenizer 修订、请求、工作点、预算、正确性容差及性能门槛。每个目标独立建立原始基线。','design'],
+ coord:['Coordinator','控制','推进阶段、组装角色回合、登记只有系统可发起的内部任务。接收阶段和任务反馈后决定下一步。','coord'],
+ registry:['Task Registry','队列','登记任务 ID、动作、请求参数和状态。Dispatcher 从这里取得待派发任务。提案 ID 可与任务 ID 关联。','delegate'],
+ dispatch:['Dispatcher','调度','按队列优先级、预算、设备和冲突资源决定何时启动。回收完成结果、广播 delegated_result，再提交 Writeback。','dispatch'],
+ writeback:['Coordinator Writeback','回写','记录任务结果、证据位置和去留。满足晋升条件后写当前接受版。扫描结果写 last_conc_sweep。','reap'],
+ context:['Shared State / Inbox','状态','持有当前接受版、阶段、预算、历史和最近的热点。收件箱让下一角色回合看到结果、拒绝原因和未处理事项。','coord'],
+ base:['Baseline Executor','执行','按目标环境和冻结工作点安排原始服务测量。记录实际启动身份、原始成绩、工作区和失败日志。','baseline'],
+ gate:['基线闸门','准入','基线运行失败或结果不可用时保留原始记录，按失败类型、开关和预算判断是否进入 ENABLEMENT。','loop'],
+ baseline:['原始基线','证据','首次可用的原始配置成为本 Session 的累计比较基准。如需最小可运行修复，原始失败和修复独立保存。','loop'],
+ enablement:['Enablement Specialist','Agent','调查启动或评测阻塞，提交最小可运行修复及验证办法。修复经过准入和实际重跑才可建立基线。','loop'],
+ capture:['采集准入','准入','初采要求有效基线、硬件能力、资源和预算。框架收益、算子入口或回环可触发复采检查。','prelude'],
+ profiler:['Profiler','执行','按指定版本和工作点采集。输出原始 trace、窗口、工具版本、rank 与失败原因。','profile'],
+ trace:['Trace Analysis','分析','把 trace 归并成热点、数量、耗时、工作点与可用调用位置，保留每条摘要所引用的原始 trace。','kernel'],
+ orchestration:['Orchestration','Agent','根据目标、阶段、剩余预算、接受版、热点和收件箱，发出直接委派、正式提案或阶段建议。','loop'],
+ router:['Intent Router','控制','先调用 PolicyGate，再按意图类型分路。正式提案保存待审记录，Critic 意见按提案 ID 回关联。','router'],
+ policy:['PolicyGate','准入','核对角色、阶段、动作权限、预算和路径。阶段内部动作由 Coordinator 登记。','policy'],
+ pending:['待审提案 / Inbox','状态','保存 proposal_id、提案内容、作者和证据引用，供 Coordinator 组装 Critic 回合。待审包为空时跳过模型调用。','router'],
+ critic:['Critic','Agent','审查候选范围、可比证据、预期收益与风险。返回带目标提案 ID 的 review_verdict。','router'],
+ judge:['Critic · 实测裁决','Agent','读取由评测端封存的独立证据，按锁定规则给出 KEEP、REVERT 或缺证待补，并交 Coordinator Writeback。','design'],
+ denied:['拒绝或退回','证据','把准入失败、退回理由或缺少的证据写入收件箱。下一回合据此补证、调整方向或停止。','router'],
+ explore:['Explore','执行','由当前接受版派生参数候选，去重并测试。Runner 返回单项结果，Explore 对整轮候选结算并回交。','explore'],
+ specialist:['Specialist','Agent','根据热点、日志和源码调查，可交参数建议、代码位置或补丁与自测。源码改动在独立工作区形成。','specialist'],
+ proposal:['正式集成提案','输入','引用父版本、补丁、实际调用路径、已有证据、预期效果和回退办法，进入正式审查。','router'],
+ integrate:['Integrate Patch','执行','独占集成资源后隔离试装，确认实际版本，安排正确性与同工作点复测。上游与 Hyperloop 的验收次序可在下层执行页对照。','rebench'],
+ verify:['独立验证器','准入','Hyperloop 的评测端持有 Reference 和阈值。校验实际加载身份、服务输出或算子数值，之后才放行同层性能计时。','design'],
+ bench:['Benchmark Runner','执行','在同一工作点按锁定预热和重复策略执行测量。正式计时关闭 Profile，保存原始请求样本和汇总。','baseline'],
+ hint:['转算子阶段建议','控制','阶段建议带上框架收益、剩余热点和理由。Coordinator 结合开关、预算、是否还有在途工作判断去向。','frame'],
+ refresh:['条件复采','准入','按版本或工作点变化、已验证增量、资源和预算检查。复采结果写回后供后续回合读取。','frame'],
+ kentry:['kernel_agent 任务','控制','Coordinator 在 KERNEL 阶段入口登记，Dispatcher 派发。任务从会话状态读取已选后端和当前接受版。','kphase'],
+ ktrace:['Forge 按需复采','准入','Forge 检查现有 Trace 是否适用，符合条件时以当前接受版复采。GEAK 的内部采集由 GEAK 自行组织。','ktail'],
+ gemm:['Forge GEMM 调优','执行','符合前置条件时调 GEMM 工作点，结算后进入共用阶段。前置调优跳过时仍可做源码改写。','kphase'],
+ fusion:['Forge Fusion 准入','准入','检查开关、框架、可用 trace 和既有结论。符合条件才尝试融合，有可用补丁时走服务验证。','ktail'],
+ geak:['GEAK 服务流程','执行','接收当前接受版、模型和负载。它内部决定是否改配置、换后端或调用 kernel_workflow 改写热点。','geak'],
+ geakApply:['GEAK Integrator','执行','把候选装回 GEAK 启动的 SGLang。GEAK 内部用固定工作点测服务，交回 result.json 及可用的配置或算子产物。','geak'],
+ geakBench:['Hyperloom Explore','执行','常规路径独立复测 GEAK 候选并写回。原生源码走专门集成路径，常规测试条件无法承载时可转 GEAK 测试路径复验。','geakbench'],
+ forgeHandoff:['Forge Handoff','交接','交 workload.md、serving-context.md 和 trace-evidence.md。Forge 的控制器据此选点，允许在可用证据有限时自行调查。','ktail'],
+ forge:['Rewrite Controller','控制','把机会分析结果转成算子任务，逐算子派到 forge-loop。可从多个任务中逐个发布合格补丁。','forge'],
+ implementer:['Forge Implementer','Agent','改写热点算子，交实现给 Forge 的构建和测试流程。','forge'],
+ forgeCheck:['Forge 算子验证','执行','构建后对参考输出校验，再测设备耗时。向 Hyperloom 交补丁、算子判断及证据。','kernel'],
+ forgeLand:['Hyperloom 算子集成器','执行','把 Forge 补丁装进已接受的框架和算子栈，发起整服务复测。服务 KEEP 且提交成功后才记保留。','land'],
+ none:['无可集成候选','证据','记录无收益、构建失败、正确性失败或搜索耗尽的原因，继续使用当前接受版。','kernel'],
+ kroll:['算子任务汇总','证据','单候选证据先结算，任务摘要投到编排收件箱，Dispatcher 回收终态并释放资源。','kernel'],
+ session:['Session 证据库','证据','保留启动身份、正确性 Reference 引用、算子计时、服务样本、按 rank 的 trace 和裁决。','breakdown'],
+ stack:['整栈复测','执行','从实际要交付的接受版启动，确认框架与算子一起加载，送同一批请求。未验证且条件允许时由 Coordinator 调度补测。','stack'],
+ sweepgate:['SWEEP 准入','准入','先收清已有候选与栈验证。按开关、预算和与上次扫描相比的已验证新增收益决定是否登记 conc_sweep。','sweep'],
+ sweep:['ConcSweepExecutor','执行','冻结原始版和当前接受版，逐并发档调用 Runner 成对测试，保留完成配对与原始样本。','sweep'],
+ skip:['跳过扫描','证据','记录开关、预算或无新增验证收益等原因。阶段机据此和回环条件检查下一步。','sweep'],
+ cycle:['Phase Machine','控制','读取 last_conc_sweep、目标、预算及收敛情况。扫描失败进入 CLOSE，成功或按规则跳过时再判断回环。','phase'],
+ close:['CLOSE','控制','结算在途任务和停止原因。最终栈未验证且条件允许时补测，也可按条件补终态 Profile。','close'],
+ report:['Report / Session Breakdown','证据','使用落盘记录导出流程、版本去留、父版和原始基线对照、原始样本与按 rank 的证据位置。','breakdown'],
+ recipe:['RecipeKB','证据','记录有效配置、适用条件和失败线索。后续 Session 引用为候选线索并重新验证。','loop'],
+ envelope:['执行请求','接口','携带 session_id、task_id、attempt_id、候选与父版身份、目标配置、冻结工作点、评测规则和证据输出位置。','design'],
+ probe:['设备探测','适配','核对实际型号、可见设备和 rank、驱动、CANN、torch_npu、SGLang 及工具版本。双卡执行所选并行方式需要的通信预检。','design'],
+ workspace:['隔离工作区 / 租约','执行','按父版本准备候选工作区并限制进程写权限。Dispatcher 协调设备、服务端口、构建和工作区租约。','design'],
+ tool:['算子工具','适配','按目标工具链构建候选，记录源码、构建参数、产物指纹、dtype、shape 和实际分片条件。在独立评测端校验后做设备计时。','design'],
+ service:['SGLang 启停','适配','把冻结配置映射为实际启动参数。检查健康、进程归属、日志、实际加载版本与候选路径。任务完成或失败后按租约清理。','design'],
+ load:['加载身份检查','证据','核对当前服务实际加载的源码、算子扩展、环境、rank 和调用路径，记录意图身份和观察到的身份。','design'],
+ timing:['服务计时','适配','加载身份和正确性通过后，关闭采集，按固定工作点独立重测父版与候选，输出吞吐、TTFT、TPOT 和原始样本。','design'],
+ traceRank:['逐 rank 采集与解析','适配','按工作点独立重放，记录实际 rank、时间窗口、工具和原始 trace。双卡保存两个 rank 的 trace 及对齐证据。','design'],
+ bundle:['封存证据包','证据','由评测端登记并校验候选、工作点、目标与样本归属。保留原始基线、父版配对、参考结果、计时、采集和失败原因的独立引用。','design'],
+ cleanup:['清理与恢复','执行','停止本任务启动的服务及子进程，隔离或恢复测试改动，释放资源。重试分配新的 attempt_id，历史证据保留。','design']
+};
+const stages=[
+ {id:'prepare',name:'PRELUDE / ENABLEMENT',title:'建立原始基线和首次证据',intro:'先冻结一个可重复的服务工作点，再把原始成绩和热点交给后续 Agent。',routes:[
+  ['原始基线',[
+   ['start','模型、环境、固定请求和评测规则','coord'],
+   ['coord','登记内部 baseline 动作与所需资源','dispatch'],
+   ['dispatch','执行原始版本与启动配置','base'],
+   ['base','同工作点请求、预热和重复测量要求','bench'],
+   ['bench','测量、服务日志、加载身份或失败证据','gate'],
+   ['gate','可用首测结果和证据引用','writeback'],
+   ['writeback','保存首次可用的原始基线','baseline']]],
+  ['启动或评测失败',[
+   ['gate','保留原尝试，报告失败类型和证据','coord'],
+   ['coord','开关与预算允许时派最小修复任务','enablement'],
+   ['enablement','修复、适用点和验证办法，经审查后重跑','base'],
+   ['coord','修复关闭、失败或预算用尽时交停止原因','close']]],
+  ['另排首次 Profile',[
+   ['baseline','有效基线、固定工作点和版本','capture'],
+   ['capture','采集能力与资源满足，登记采集','profiler'],
+   ['profiler','原始 trace、rank、窗口与采集身份','trace'],
+   ['trace','热点、调用位置与原始证据链接','context'],
+   ['capture','缺采集能力或预算时，写跳过原因','context']]]]},
+ {id:'roles',name:'Agent 回合与准入',title:'从热点证据走到正式任务',intro:'直接委派和正式提案分别登记。Critic 审查的是提案，实测之后另做版本裁决。',routes:[
+  ['Coordinator 发起回合',[
+   ['context','目标、阶段、预算、接受版、热点、历史和收件箱','coord'],
+   ['coord','组装本轮上下文与可用动作','orchestration'],
+   ['orchestration','delegate、propose_action 或阶段建议','router'],
+   ['router','角色、动作、参数与涉及的路径','policy']]],
+  ['允许直接委派',[
+   ['policy','权限和阶段通过，返回准入','router'],
+   ['router','登记 Explore 或 Specialist 任务并返回任务 ID','registry'],
+   ['registry','待派任务、资源条件与动作参数','dispatch']]],
+  ['正式提案交 Critic',[
+   ['policy','准入通过的正式提案与证据引用','pending'],
+   ['pending','待审提案编号、历史和证据','coord'],
+   ['coord','发起 Critic 回合，交当前提案与审查口径','critic'],
+   ['critic','review_verdict、目标提案 ID 和理由','router'],
+   ['router','批准或带建议放行后，把动作登记为任务','registry']]],
+  ['拒绝和退回',[
+   ['policy','权限、预算或路径拒绝及理由','denied'],
+   ['router','退回或待重写的审查结果','denied'],
+   ['denied','反馈到提案人收件箱，下轮可补证或调整','context']]]]},
+ {id:'framework',name:'FRAMEWORK A / B / C',title:'框架阶段的三条分支',intro:'调参和补丁有各自的交付方式，实测结果回到同一个版本结算入口。',routes:[
+  ['A · Explore 参数试跑',[
+   ['dispatch','任务 ID、参数候选、父版本与锁定工作点','explore'],
+   ['explore','对候选去重，叠加参数后提交试跑','bench'],
+   ['bench','把每组服务测量交回 Explore','explore'],
+   ['explore','整轮选择、KEEP / REVERT 与原始样本引用','dispatch']]],
+  ['B · 从调查到正式提案',[
+   ['dispatch','热点、日志、调用位置和调查范围','specialist'],
+   ['specialist','交参数建议、源码发现或独立工作区补丁','dispatch'],
+   ['dispatch','回收 delegated_result 和候选产物','context'],
+   ['context','提供研究结果，合格的补丁组织正式集成提案','proposal'],
+   ['proposal','补丁、父版、调用点、自测和回退证据，重新走准入与审查','router']]],
+  ['B · 集成与复测',[
+   ['registry','正式提案获准，登记独占集成任务','dispatch'],
+   ['dispatch','资源空出，派发补丁和当前接受版','integrate'],
+   ['integrate','确认加载候选，提交整服务复测','bench'],
+   ['bench','把服务性能和适用质量结果交集成器','integrate'],
+   ['integrate','集成结论、去留和原始证据','dispatch']]],
+  ['候选回写和复采',[
+   ['dispatch','回收结果并广播，再交本轮结算','writeback'],
+   ['writeback','记录原因与证据，符合条件的 KEEP 更新接受版','context'],
+   ['context','已验证收益或工作点变化触发复采检查','refresh'],
+   ['refresh','满足能力、预算和资源时派采集','profiler']]],
+  ['C · 是否转入算子阶段',[
+   ['orchestration','提交转阶段建议和剩余热点','router'],
+   ['router','通过准入的转算子建议','hint'],
+   ['hint','结合在途任务、开关与预算判断框架能否退出','coord'],
+   ['coord','允许算子阶段时登记内部任务','kentry'],
+   ['coord','算子关闭且框架完成时交扫描入口','sweepgate']]]]},
+ {id:'kernel',name:'KERNEL GEAK / Forge',title:'同一个 Attention 热点的两条路线',intro:'上游举例从同一接受版和负载出发。一次 Session 使用会话记录的一个后端，默认 GEAK，显式选择才走 Forge。',routes:[
+  ['阶段入口',[
+   ['coord','按阶段规则登记内部任务','kentry'],
+   ['kentry','按已选后端申请服务、评测和工作区资源','dispatch']]],
+  ['GEAK · 服务优化由谁完成',[
+   ['dispatch','当前接受版、启动参数、模型和请求负载','geak'],
+   ['geak','内部改写或调优 Attention，交内部集成','geakApply'],
+   ['geakApply','GEAK 装回 SGLang 并测整套服务，交 result.json 及可用方案','geakBench'],
+   ['geakBench','Hyperloom 复测后交成绩与候选结论','writeback']]],
+  ['Forge · 前置支路与交接',[
+   ['dispatch','符合条件时复采并先做 GEMM 调优','ktrace'],
+   ['ktrace','需要前置调优时，交采集证据','gemm'],
+   ['gemm','有无接受项均继续共用后续阶段','fusion'],
+   ['dispatch','跳过前置 GEMM 时也进入共用阶段','fusion'],
+   ['fusion','按条件尝试融合或记录跳过，整理负载和 trace','forgeHandoff']]],
+  ['Forge · 改算子与装回服务',[
+   ['forgeHandoff','负载、服务上下文与采集证据','forge'],
+   ['forge','选中 Attention，委派算子改写','implementer'],
+   ['implementer','算子实现和可构建候选','forgeCheck'],
+   ['forgeCheck','交可用补丁、参考校验与设备计时','forgeLand'],
+   ['forgeLand','在当前接受版加载补丁，发固定服务请求','bench'],
+   ['bench','把整套 SGLang 成绩交回集成器','forgeLand'],
+   ['forgeLand','服务 KEEP 且提交成功，产物与版本可写回','writeback']]],
+  ['无成果和任务回收',[
+   ['none','失败、无收益或预算耗尽的记录','kroll'],
+   ['writeback','候选去留与可复查证据','kroll'],
+   ['kroll','候选和整栈证据落盘','session'],
+   ['kroll','任务摘要进入下一回合收件箱','context'],
+   ['kroll','任务终态，回收并释放资源','dispatch']]]]},
+ {id:'close',name:'SWEEP / 回环 / CLOSE',title:'扫描怎么回传，如何决定下一步',intro:'先结算当前优化栈。扫描结果和阶段决定分别记录，便于复查为什么回到框架或停止。',routes:[
+  ['开始扫描',[
+   ['coord','处理在途候选及待验证的当前优化栈','sweepgate'],
+   ['sweepgate','开关、增益与预算满足，登记内部 conc_sweep','dispatch'],
+   ['dispatch','原始版、接受版和要试的并发档','sweep'],
+   ['sweep','逐档对原始版与接受版发对应同一请求集','bench'],
+   ['bench','原始样本、完成配对、延迟与失败记录','sweep']]],
+  ['成功、失败或跳过如何回传',[
+   ['sweep','把扫描状态、配对结果和证据路径交回','dispatch'],
+   ['dispatch','回收扫描任务结果，交 Coordinator Writeback','writeback'],
+   ['writeback','写 last_conc_sweep，阶段机读取结果','cycle'],
+   ['sweepgate','开关关闭、预算不足或无新增收益，记录原因','skip'],
+   ['skip','阶段机读取跳过记录及下一轮条件','cycle']]],
+  ['继续或停止',[
+   ['cycle','成功或按规则跳过，目标未达且预算、收敛条件允许时，带接受版回框架','context'],
+   ['context','新一轮读取当前版本、已有失败和扫描证据','orchestration'],
+   ['cycle','扫描失败，或回环条件不成立，交停止原因','close']]],
+  ['最终报告怎么产生',[
+   ['close','还有未验证的 KEEP 且满足条件时，派整栈补测','stack'],
+   ['stack','确认同时加载的改动、固定请求和服务成绩','writeback'],
+   ['close','条件允许时采终态 Profile，保留实际版本和 rank','profiler'],
+   ['close','最终接受方案、适用工作点与经验记录','recipe'],
+   ['close','用已落盘的事件、样本与裁决生成报告及证据索引','report']]]]},
+ {id:'execution',name:'下层执行',title:'一条任务怎样在昇腾上运行并交回证据',intro:'相同请求契约驱动模拟、单卡 910B3 和双卡 910B2。图中是 Hyperloop 底稿的执行设计。',routes:[
+  ['下发任务、连接目标与分配资源',[
+   ['start','预期设备、并行方式、软件与必需能力','probe'],
+   ['probe','实际环境指纹、设备和 rank 表、通信与能力结果','coord'],
+   ['coord','按能力决定允许的动作，登记目标与冻结工作点','dispatch'],
+   ['dispatch','附任务与尝试 ID、父版、目标与设备和端口租约','envelope'],
+   ['envelope','按任务准备独立工作区','workspace']]],
+  ['建立原始基线',[
+   ['workspace','原始版本、环境和启动参数','service'],
+   ['service','实际进程、健康、启动日志和加载身份','load'],
+   ['load','确认模型、框架、设备和工作点后验证服务输出','verify'],
+   ['verify','正确性通过，按冻结条件做独立计时','timing'],
+   ['timing','逐次原始样本和成绩归入本目标的原始基线','bundle']]],
+  ['框架参数或源码候选',[
+   ['envelope','父版本与参数变更或框架补丁，锁定评测条件','workspace'],
+   ['workspace','参数叠加配置，补丁按需构建，交候选启动信息','service'],
+   ['service','实际版本、参数、健康和加载记录','load'],
+   ['load','确认候选生效，交独立服务输出校验','verify'],
+   ['verify','通过才测父版与候选，输出正确性证据','timing'],
+   ['timing','记录相同工作点的两组样本及计时边界','bundle']]],
+  ['算子候选与整栈服务复测',[
+   ['workspace','当前接受版、候选源码、目标 shape、dtype 和 rank 分片','tool'],
+   ['tool','构建产物与参考输入，独立检查算子输出','verify'],
+   ['verify','数值通过，按设备同步口径放行算子计时','tool'],
+   ['tool','构建、算子验证和设备计时记录回包，候选产物装进当前接受版','service'],
+   ['service','框架与候选算子的实际加载身份','load'],
+   ['load','校验完整服务输出，然后做同工作点端到端复测','verify'],
+   ['verify','通过才交 Runner 测吞吐及延迟','timing'],
+   ['timing','服务样本与算子证据分别引用','bundle']]],
+  ['Profile 采集和正式计时各走一条路径',[
+   ['envelope','指定已加载版本、工作点、rank 范围与采集窗口','traceRank'],
+   ['traceRank','原始 trace 和 rank 对齐记录，按目标检查完整性','trace'],
+   ['trace','热点、调用点、工具版本和原始 trace 引用','bundle'],
+   ['envelope','固定工作点、预热与重复策略，正式测量关闭 Profile','timing'],
+   ['timing','逐请求样本及汇总归档','bundle']]],
+  ['回收、裁决和重试',[
+   ['verify','校验不通过时保留失败样本和参考引用','bundle'],
+   ['bundle','证据包、必需缺项和错误原因','dispatch'],
+   ['workspace','停止归属本任务的进程，检查临时改动与资源清理','cleanup'],
+   ['cleanup','交清理结果，确认释放后才允许重试或派新任务','dispatch'],
+   ['dispatch','回收任务、租约及证据，交 Coordinator','coord'],
+   ['coord','发起实测裁决回合，使用独立证据和锁定阈值','judge'],
+   ['judge','交 KEEP / REVERT 或缺证原因、所用证据','writeback'],
+   ['writeback','核对父版和产物，再记录版本动作、证据及比较结果','session']]]]}
+];
+const $=id=>document.getElementById(id);
+function make(tag,cls,text){const el=document.createElement(tag);if(cls)el.className=cls;if(text)el.textContent=text;return el;}
+function current(){const [view,id]=location.hash.slice(1).split('/');return [view,stages.find(s=>s.id===view),id];}
+function setHash(stage,id){const next=stage+(id?'/'+id:'');if(location.hash==='#'+next)render();else location.hash=next;}
+function nodeButton(id,active,stage){const d=nodes[id],button=make('button','node');button.type='button';button.dataset.kind=d[1];button.setAttribute('aria-pressed',String(id===active));button.append(make('span','kind',d[1]),make('strong','',d[0]));button.onclick=()=>setHash(stage,id);return button;}
+function connections(stage,id){
+ const upstream=new Set(),downstream=new Set();
+ for(const [,handoffs] of stage.routes)for(const [from,,to] of handoffs){
+  if(to===id)upstream.add(from);
+  if(from===id)downstream.add(to);
+ }
+ return [upstream,downstream];
+}
+function detail(stage,id){
+ const box=make('aside','detail');box.setAttribute('aria-live','polite');if(!id||!nodes[id]){box.append(make('h3','','部件详情'),make('p','','点击流程中的部件，查看职责、进入条件、交付和源码。'));return box;}
+ const d=nodes[id];box.append(make('h3','',d[0]),make('p','',d[2]));const cite=make('a','',evidence[d[3]][1]);cite.href=evidence[d[3]][0];box.append(cite);
+ connections(stage,id).forEach((set,i)=>{if(!set.size)return;const row=make('div','detail-nav');row.append(make('p','',i?'交给':'接收'));for(const related of set){const b=make('button','',nodes[related][0]);b.type='button';b.onclick=()=>setHash(stage.id,related);row.append(b);}box.append(row);});return box;
+}
+
+function handoffRoute(stage,title,handoffs,active){
+ const route=make('article','flow');
+ route.append(make('h3','',title));
+ const headings=make('div','handoff-head');
+ for(const label of ['交出方','交接内容','接手方'])headings.append(make('span','',label));
+ const list=make('ol','handoffs');
+ for(const [from,transfer,to] of handoffs){
+  const row=make('li','handoff');
+  row.append(nodeButton(from,active,stage.id),make('span','transfer',transfer),nodeButton(to,active,stage.id));
+  list.append(row);
+ }
+ route.append(headings,list);
+ return route;
+}
+
+function stageLinks(entries){
+ const nav=make('nav','route-entry');
+ nav.setAttribute('aria-label','相关流程');
+ for(const [label,href] of entries){const link=make('a','',label);link.href=href;nav.append(link);}
+ return nav;
+}
+
+function attentionComparison(){
+ const section=make('section','comparison');
+ section.append(make('h3','','Attention 热点交接对照'));
+ const table=make('table','scores');
+ const header=table.createTHead().insertRow();
+ for(const title of ['步骤','GEAK','Forge']){
+  const cell=make('th','',title);cell.scope='col';header.append(cell);
+ }
+ const body=table.createTBody();
+ for(const [step,geak,forge] of [
+  ['谁改','GEAK 内部 kernel_workflow 改写 Attention，也可尝试切换后端。','Rewrite Controller 选点，Forge Implementer 改写 Attention。'],
+  ['谁装','GEAK Integrator 装进自己的 SGLang。','Forge 先校验并测算子。Hyperloom 的集成器收到补丁后装回当前 SGLang。'],
+  ['谁测整服务','GEAK 先测，Hyperloom 再用 Explore / Runner 复测。','Hyperloom 集成器请求 Benchmark Runner 测框架和候选算子的组合。'],
+  ['交回什么','GEAK 交服务成绩与可用配置或算子产物。','Forge 交补丁、正确性和设备计时。服务实测由 Hyperloom 另行记录。']
+ ]){
+  const row=body.insertRow();const label=make('th','',step);label.scope='row';row.append(label);
+  for(const value of [geak,forge])row.insertCell().textContent=value;
+ }
+ section.append(table);
+ return section;
+}
+
+function executionTargets(){
+ const section=make('section','comparison');
+ section.append(make('h3','','执行端如何按目标切换'));
+ const grid=make('div','boundary');
+ for(const [title,text] of [
+  ['模拟执行端','走同一套接口，用受控的启动、样本和失败结果演练交接。Session 标为 simulated。'],
+  ['单张 910B3','单卡建立自己的基线并记录一个 rank。用实际预检确认 CANN、SGLang 和采集能力。'],
+  ['双 910B2','双卡单独建基线。以 TP=2 举例，预检两 rank 与 HCCL，Profile 对齐并保留两份原始 trace。']
+ ]){
+  const item=make('article');item.append(make('h4','',title),make('p','',text));grid.append(item);
+ }
+ section.append(grid);
+ return section;
+}
+
+const original={revision:'baseline-v0',samples:[99.8,100,100.2],ttftP95Ms:[125,124,125],tpotP95Ms:[28,28.1,27.8]};
+const accepted={revision:'R01',samples:[109.8,110,110.2],ttftP95Ms:[125,125,126],tpotP95Ms:[28,28,28.1]};
+const forgeResult={revision:'R02',samples:[111.8,112,112.2],ttftP95Ms:[126,127,125],tpotP95Ms:[28.1,28,28.2]};
+const rule={repeats:3,minimumGain:2,maximumLatencyRegression:5,absoluteTolerance:0.01};
+const exampleReviews={
+ keep:{id:'R01',label:'框架参数',parent:original,candidate:accepted,error:0.001},
+ revert:{id:'R02',label:'算子补丁',parent:accepted,candidate:forgeResult,error:0.002},
+ missing:{id:'R03',label:'父版配对缺失',parent:accepted,candidate:{...forgeResult,revision:'R03'},error:0.002,unpaired:true}
+};
+
+function showBoundary(){
+ const section=make('section');
+ section.append(make('h3','','换卡时的替换边界'));
+ const grid=make('div','boundary');
+ for(const [title,description] of [
+  ['上层执行循环','Orchestration、Critic、PolicyGate、任务和裁决消费标准结果。设备能力由预检交回，阶段逻辑按能力和证据推进。'],
+  ['交互契约','下发目标配置、冻结工作点、版本和执行请求。回传实际环境、执行状态、证据引用与失败原因。每条记录关联 Session、候选和任务。'],
+  ['可替换底层','设备探测、SGLang 启停、计时、Profile 和算子工具分别实现接口。已有实现能覆盖的差异通过配置切换。']
+ ]){
+  const card=make('article');
+  card.append(make('h4','',title),make('p','',description));
+  grid.append(card);
+ }
+ section.append(grid,make('p','target-note','单张 910B3 与双 910B2 可复用冻结请求和上层策略。各自建基线。双卡示例按 TP=2 保留两个 rank 的证据。'),stageLinks([['查看下层执行交接','#execution']]));
+ return section;
+}
+
+function median(samples){
+ const sorted=[...samples].sort((left,right)=>left-right);
+ return (sorted[Math.floor((sorted.length-1)/2)]+sorted[Math.floor(sorted.length/2)])/2;
+}
+function gain(candidate,reference){return 100*(candidate/reference-1);}
+function formatGain(value){return value===null?'待复算':`${value>=0?'+':''}${value.toFixed(2)}%`;}
+
+function measureTable(review,candidateValue,overParent,overOriginal){
+ const table=make('table','scores');
+ table.setAttribute('aria-label','模拟吞吐对比');
+ const head=table.createTHead().insertRow();
+ for(const title of ['比较对象','版本','输出 tok/s','候选相对变化']){
+  const cell=make('th','',title);
+  cell.scope='col';
+  head.append(cell);
+ }
+ const body=table.createTBody();
+ for(const values of [
+  ['原始基线',original.revision,String(median(original.samples)),formatGain(overOriginal)],
+  ['父版',review.parent.revision,review.unpaired?'本轮缺配对':String(median(review.parent.samples)),formatGain(overParent)],
+  ['当前候选',review.candidate.revision,candidateValue===null?'缺少样本':String(candidateValue),'—']
+ ]){
+  const row=body.insertRow();
+  values.forEach(value=>{row.insertCell().textContent=value;});
+ }
+ return table;
+}
+
+function rawChain(review,complete,latencyChanges){
+ const container=make('div','raw-chain');
+ container.append(make('h3','','逐项查看模拟原始证据'));
+ const evidenceChain=[
+  ['冻结条件与运行归属',{session:'demo-session',task:'p0',environment:'simulated-v1',proposal:review.id,parent:review.parent.revision,baseline:original.revision}],
+  ['Profile、候选改动与加载记录',{source:'采集与独立执行记录',profile:`demo-profile-${review.parent.revision}`,rank:0,revision:review.candidate.revision,loadedRevision:review.candidate.revision,check:'PASS'}],
+  ['正确性与参考输出',{source:'独立验证器',reference:'sim-ref-v1',maxAbsoluteError:review.error,absoluteTolerance:rule.absoluteTolerance,result:review.error<=rule.absoluteTolerance?'PASS':'FAIL'}],
+  ['关闭 Profile 后的原始计时样本（tok/s）',{source:'独立 Runner',expectedRepeats:rule.repeats,original,parent:review.unpaired?null:review.parent,candidate:review.candidate}],
+  ['裁决规则与证据缺口',{minimumGainOverParentPct:rule.minimumGain,maximumLatencyRegressionPct:rule.maximumLatencyRegression,latencyChanges,missing:review.unpaired?['父版同工作点配对']:[],status:complete?'证据可复核':'待补证'}]
+ ];
+ for(const [title,data] of evidenceChain){
+  const details=make('details');
+  details.append(make('summary','',`${title} · 模拟`),make('pre','',JSON.stringify({mode:'simulated',bundle:`demo-${review.id}`,...data},null,2)));
+  container.append(details);
+ }
+ return container;
+}
+
+function validation(id){
+ const key=Object.hasOwn(exampleReviews,id)?id:'revert';
+ const review=exampleReviews[key];
+ const candidateValue=review.candidate.samples.length===rule.repeats?median(review.candidate.samples):null;
+ const complete=candidateValue!==null&&!review.unpaired;
+ const overParent=complete?gain(candidateValue,median(review.parent.samples)):null;
+ const overOriginal=complete?gain(candidateValue,median(original.samples)):null;
+ const latencyChanges=complete?Object.fromEntries(['ttftP95Ms','tpotP95Ms'].map(metric=>[metric,formatGain(gain(median(review.candidate[metric]),median(review.parent[metric])))])):null;
+ const latencyPass=complete&&['ttftP95Ms','tpotP95Ms'].every(metric=>gain(median(review.candidate[metric]),median(review.parent[metric]))<=rule.maximumLatencyRegression);
+ const correct=review.error<=rule.absoluteTolerance;
+ const qualifies=correct&&latencyPass&&overParent>=rule.minimumGain;
+ const missReason=!correct?'正确性超出容差':!latencyPass?'延迟回归超出上限':`低于 +${rule.minimumGain}% 门槛`;
+ const panel=make('div','validation-view');
+ panel.append(showBoundary());
+ const section=make('section');
+ section.append(make('h3','','模拟验收（simulated）'));
+ const controls=make('div','review-controls');
+ controls.setAttribute('aria-label','选择模拟候选');
+ for(const [option,example] of Object.entries(exampleReviews)){
+  const button=make('button','',`${example.id} · ${example.label}`);
+  button.type='button';
+  button.dataset.review=option;
+  button.setAttribute('aria-pressed',String(key===option));
+  button.onclick=()=>setHash('validation',option);
+  controls.append(button);
+ }
+ const summary=make('dl','decision-grid');
+ summary.setAttribute('aria-live','polite');
+ for(const [label,result,state] of [
+  ['证据状态',complete?'证据齐全，可复核':'缺少父版配对',complete?'pass':'pending'],
+  ['验收结果',complete?(qualifies?'达标':`未达标，${missReason}`):'无法判定，待补证',complete?(qualifies?'pass':'fail'):'pending'],
+  ['版本动作',qualifies?`KEEP · 接受 ${review.id}`:complete?`REVERT · 保留 ${review.parent.revision}`:`保留 ${review.parent.revision}，补证后重算`,qualifies?'pass':complete?'fail':'pending']
+ ]){
+  const cell=make('div');
+  cell.dataset.state=state;
+  cell.append(make('dt','',label),make('dd','',result));
+  summary.append(cell);
+ }
+ const explanation=complete
+  ? '候选、父版与原始基线来自同一冻结工作点。验收用相对父版的增益，报告同时给出相对原始基线的变化。'
+  : '候选样本已留存。本轮缺少同工作点的父版配对，补齐后才能计算增益并核对回归。';
+ section.append(controls,summary,measureTable(review,candidateValue,overParent,overOriginal),make('p','review-note',explanation),rawChain(review,complete,latencyChanges));
+ panel.append(section);
+ return panel;
+}
+
+function render(){
+ const [view,stage,id]=current(), tabs=$('tabs'), host=$('stage');
+ const focused=document.activeElement?.dataset?.key;
+ const focusedReview=document.activeElement?.dataset?.review;
+ tabs.replaceChildren();host.replaceChildren();
+ const active=view==='validation'?'validation':stage?.id??'overview';
+ $('walkthrough').hidden=active==='validation'||active==='execution';
+ for(const [key,label] of [['overview','全局架构'],...stages.map(s=>[s.id,s.name]),['validation','复用与验证']]){const b=make('button','',label);b.type='button';b.dataset.key=key;b.setAttribute('aria-selected',String(active===key));b.onclick=()=>setHash(key);tabs.append(b);}
+ const head=make('div','stage-head');
+ if(active==='validation'){
+  head.append(make('h2','','复用边界与证据验收'),make('p','','切换设备执行端，沿原始证据复核本轮结果。'));
+  host.append(head,validation(id));
+  if(focused)tabs.querySelector(`[data-key="${focused}"]`)?.focus();
+  if(focusedReview)host.querySelector(`[data-review="${focusedReview}"]`)?.focus();
+  return;
+ }
+ head.append(make('h2','',stage?.title??'从基线到结果交付'),make('p','',stage?.intro??'点击阶段查看交接。每一行按交出方、交接内容和接手方阅读。'));
+ host.append(head);
+ if(!stage){
+  const map=make('div','overview-flow');
+  stages.filter(s=>s.id!=='execution').forEach((s,i)=>{
+   if(i){const arrow=make('span','edge','→');arrow.setAttribute('aria-hidden','true');map.append(arrow);}
+   const button=make('button','stage-link');button.type='button';
+   button.append(make('strong','',s.name),make('span','',s.title));
+   button.onclick=()=>setHash(s.id);map.append(button);
+  });
+  host.append(map,make('p','target-note','算子关闭时从框架直接到 SWEEP。扫描结算后可回框架新一轮，或到 CLOSE 做最后检查与报告。'));
+  const grid=make('div','meta-grid');for(const [title,value] of [
+   ['Agent 运行时','本地回放和真机共用 Orchestration、Critic、Specialist 的角色接口、回合语义及意图格式。有真实模型服务时按相同契约接入。'],
+   ['设备执行端','模拟、910B3 TP=1 与双 910B2 TP=2 切换设备、SGLang 进程、压测、采集、构建和清理。上层读取统一结果。'],
+   ['独立验证与可视化','评测方掌握基线、保护的 Reference 和固定门槛。报告把回合、提案、任务、样本、版本和各 rank 证据串起来。']]){const card=make('article');card.append(make('h3','',title),make('p','',value));grid.append(card);}
+  host.append(grid,stageLinks([['查看下层执行','#execution'],['查看证据与裁决','#validation']]));
+ }else{
+  const reference={prepare:'arch-prelude',roles:'arch-orchestration',framework:'arch-framework',kernel:'arch-step-kernel-backend',close:'arch-sweep'};
+  const links=stage.id==='execution'
+   ? [['基线与采集的上游入口','#prepare'],['复核一轮证据','#validation'],['下层执行规划','通用底稿初步规划.md']]
+   : [['打开源码参考中的对应段','源码架构参考.html#'+reference[stage.id]],['查看下层如何执行','#execution']];
+  host.append(stageLinks(links));
+  if(stage.id==='kernel')host.append(attentionComparison());
+  if(stage.id==='execution')host.append(executionTargets());
+  const lanes=make('div','lanes'),routes=make('div','routes');
+  for(const [title,handoffs] of stage.routes)routes.append(handoffRoute(stage,title,handoffs,id));
+  const details=detail(stage,id);lanes.append(routes,details);host.append(lanes);
+  if(id&&matchMedia('(max-width:970px)').matches){const bounds=details.getBoundingClientRect();if(bounds.top<0||bounds.bottom>innerHeight)details.scrollIntoView({block:'start'});}
+ }
+ if(focused)tabs.querySelector('[data-key="'+focused+'"]')?.focus();
+}
+addEventListener('hashchange',render);render();
+</script>
+</html>
