@@ -109,21 +109,24 @@ details p, .links { margin-top: 6px; }
     <div class="panel-header">
       <h2 id="result-title">本次结果</h2>
       <!-- BEGIN RUN STATUS -->
-      <span id="result-status" class="label">等待会话证据</span>
+      <span id="result-status" class="label" data-type="real">真机会话已完成 · 0a30626</span>
       <!-- END RUN STATUS -->
     </div>
     <!-- BEGIN RUN RESULTS -->
     <dl class="facts">
-      <div><dt>原始基线</dt><dd id="result-baseline">待填</dd></div>
-      <div><dt>参数候选</dt><dd id="result-candidate">待填</dd></div>
-      <div><dt>版本裁决</dt><dd id="result-verdict">待填</dd></div>
+      <div><dt>配对父版 · 分块 512</dt><dd id="result-baseline">96.77 tok/s · 首 token 202.45 ms</dd></div>
+      <div><dt>R01 · 分块 256</dt><dd id="result-candidate">83.40 tok/s · 首 token 374.39 ms</dd></div>
+      <div><dt>版本裁决</dt><dd id="result-verdict">REVERT · 保留 512</dd></div>
     </dl>
-    <p class="note" id="result-scope">完成后从本页进入会话报告和原始证据。</p>
+    <p class="note" id="result-scope">四组输出 token 全部一致。候选首 token 延迟增加 84.93%，超过 10% 上限。单独跑的原始基线为 96.24 tok/s。</p>
     <!-- END RUN RESULTS -->
     <div class="links" id="result-links">
       <a href="910B3部署与初验.md">迁移与部署日志</a>
       <!-- BEGIN RUN EVIDENCE -->
-      <!-- 在这里加入 real Session 报告、参考输出和原始证据的相对链接。 -->
+      <a href="../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/report.html#validation">实际会话交接</a>
+      <a href="../.runs/910b3-initial/20261124-0a30626-02/reference/capture.json">参考采集回执</a>
+      <a href="../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evaluation/task-0002-p0/paired_comparison.json">配对指标与差异</a>
+      <a href="../.runs/910b3-initial/20261124-0a30626-02/real/910b3-tp1-initial/evidence/decisions/task-0002-R01.json">独立裁决</a>
       <!-- END RUN EVIDENCE -->
     </div>
   </section>
@@ -132,12 +135,12 @@ details p, .links { margin-top: 6px; }
     <h2 id="input-title">验证输入</h2>
     <!-- BEGIN RUN INPUTS -->
     <dl class="facts">
-      <div><dt>环境</dt><dd id="input-environment">昇腾 910B3 单卡 · TP=1 · SGLang</dd></div>
-      <div><dt>请求</dt><dd id="input-requests">固定输入 token，与预设生成长度成对运行</dd></div>
-      <div><dt>比较对象</dt><dd id="input-parameters">原始基线与只改一个参数的候选</dd></div>
+      <div><dt>环境</dt><dd id="input-environment">910B3 单卡 · SGLang 0.5.16 · Qwen2.5-0.5B · BF16</dd></div>
+      <div><dt>请求</dt><dd id="input-requests">两组长输入、两组短输入 · 并发 2 · 每版 3 轮</dd></div>
+      <div><dt>比较对象</dt><dd id="input-parameters">原始分块 512 与 R01 分块 256</dd></div>
     </dl>
     <!-- END RUN INPUTS -->
-    <p class="note">会话预先锁定设备、模型、启动参数、请求、并发、预热、重复次数和验收门槛。</p>
+    <p class="note">出发前锁定输入和门槛。四组输出须完全一致，吞吐至少提高 5%，两项延迟各最多增加 10%。</p>
   </section>
 
   <section class="panel" id="reference" aria-labelledby="reference-title">
@@ -181,6 +184,7 @@ details p, .links { margin-top: 6px; }
       <li class="handoff"><span class="node" data-type="real">SGLang <code>/generate</code></span><span class="message">服务返回流式响应，客户端记录首 token 与完成时间</span><span class="node">BenchmarkRunner</span></li>
       <li class="handoff"><span class="node">Verifier 与 BenchmarkRunner</span><span class="message">输出核验、重复样本和环境身份</span><span class="node">Session 证据</span></li>
     </ol>
+    <p class="note">R01 校验并计时后，另起分块 512 的父版服务，按同一输入和计时规则重测。译码结果与原始参考逐 token 一致。</p>
     <details>
       <summary>三项指标从哪里来</summary>
       <p>吞吐用整个测量窗口内的生成 token 数计算。TTFT 是请求到首个输出 token 的时间，TPOT 是首个 token 后平均每个 token 的时间。</p>
