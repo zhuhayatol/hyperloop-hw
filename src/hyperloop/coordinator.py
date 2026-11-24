@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .actions.enablement import accept_startup_repair, observed_startup_failure
 from .actions.knowledge import RECIPE_PATH, build_recipe, validate_recipe
 from .actions.runtime import RuntimeActions, accepted_revision
 from .agents import AgentInvocationError, build_agent_backend
@@ -254,6 +255,11 @@ class Coordinator:
         action = task["action"]
         if action == "specialist":
             if task["params"].get("mode") == "enablement":
+                if (
+                    self.store.manifest["mode"] == "real"
+                    and self.scenario.get("agent_provider", {}).get("provider") == "deepseek"
+                ):
+                    return self._diagnose_startup(task)
                 fix = self.scenario.get("enablement")
                 return {"status": "ok", "fix": fix, "reason": "suggested_fix" if fix else "no_enablement_candidate"}
             context = self._context("specialist")
@@ -282,6 +288,25 @@ class Coordinator:
         self._runtime_probe()
         return run(task, self.state)
 
+    def _diagnose_startup(self, task: dict) -> dict:
+        baseline = next((
+            row for row in reversed(tuple(self.dispatcher.tasks.values())) if row["action"] == "baseline"
+            and row["phase"] == "PRELUDE" and (row.get("result") or {}).get("status") == "failed"
+        ), None)
+        failure = observed_startup_failure(self.store, baseline) if baseline else None
+        if failure is None:
+            return {"status": "ok", "fix": None, "reason": "no_supported_startup_failure"}
+        context = {"startup_failure": failure}
+        try:
+            responses = self.agents.run("specialist", context)
+        except AgentInvocationError as error:
+            return {"status": "failed", "reason": error.receipt["reason"], "agent_failure": error.receipt}
+        fix = accept_startup_repair(responses, failure, task["task_id"])
+        return {
+            "status": "ok", "reason": "suggested_fix" if fix else "no_verified_startup_repair",
+            "fix": fix, "startup_failure": failure, "responses": responses, "agent_call": self.agents.last_receipt,
+        }
+
     def _finish_task(self, task: dict, result: dict, receipt: dict, *, recovered_cleanup: bool = False) -> None:
         cleanup_pending = result.get("reason") == "cleanup_unconfirmed" or any(
             row.get("reason") == "cleanup_unconfirmed" for row in result.get("decisions", [])
@@ -297,7 +322,19 @@ class Coordinator:
         action = task["action"]
         common = {"task_id": task["task_id"], "receipt": receipt, "cycle": self.cycle, "phase": self.phase}
         if action == "specialist" and task["params"].get("mode") == "enablement":
-            self._emit("enablement_suggestion", {**result, **common})
+            call = result.get("agent_call") or result.get("agent_failure")
+            if call:
+                responses = result.get("responses", [])
+                turn_id = self._start_turn("specialist", {}, task["task_id"], call, responses)
+                if call["status"] == "ok":
+                    for intent in responses:
+                        self._emit("agent_intent", {"turn_id": turn_id, "role": "specialist", "intent": intent})
+                    self._emit("agent_turn_completed", {"turn_id": turn_id, "role": "specialist",
+                                                        "response_count": len(responses)})
+            self._emit("enablement_suggestion", {
+                **{key: value for key, value in result.items() if key not in {"agent_call", "agent_failure", "responses"}},
+                **common,
+            })
         elif action == "specialist":
             if result.get("agent_failure"):
                 self._start_turn("specialist", {}, task["task_id"], result["agent_failure"], [])

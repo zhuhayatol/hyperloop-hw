@@ -74,6 +74,39 @@ class DeepSeekAgentTests(TestCase):
         self.assertTrue(coordinator.store.verify_evidence(call["evidence"]))
         return read_json(coordinator.store.path / call["evidence"]["path"])
 
+    def test_startup_specialist_uses_only_the_projected_assertion_and_accepts_one_parameter(self):
+        backend = build_agent_backend(self.scenario, self.task, self.target)
+        startup = {
+            "code": "chunked_prefill_page_alignment",
+            "assertion": "chunked_prefill_size must be divisible by page_size",
+            "chunked_prefill_size": 513, "page_size": 128,
+            "startup_log": {"path": "/private/server.log", "sha256": "unneeded-by-agent"},
+        }
+        intent = {"kind": "repair_startup", "parameters": {"chunked_prefill_size": 512},
+                  "reason": "512 is the nearest positive multiple of 128."}
+
+        def transport(request, *, timeout):
+            body = json.loads(request.data)
+            projected = json.loads(body["messages"][1]["content"])
+            self.assertEqual(projected, {
+                "role": "specialist", "phase": "ENABLEMENT",
+                "startup_failure": {name: startup[name] for name in (
+                    "code", "assertion", "chunked_prefill_size", "page_size",
+                )},
+                "allowed_parameters": ["chunked_prefill_size"],
+            })
+            self.assertIn("Diagnose the supplied verified SGLang startup assertion", body["messages"][0]["content"])
+            return completion([intent])
+
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": KEY}), patch("hyperloop.agents.deepseek._HTTP.open", transport):
+            self.assertEqual(backend.run("specialist", {"startup_failure": startup}), [intent])
+        with (
+            patch.dict(os.environ, {"DEEPSEEK_API_KEY": KEY}),
+            patch("hyperloop.agents.deepseek._HTTP.open", return_value=completion([explore()])),
+        ):
+            with self.assertRaisesRegex(AgentInvocationError, "invalid_structured_response"):
+                backend.run("specialist", {"startup_failure": startup})
+
     def test_three_roles_keep_safe_inputs_outputs_and_local_outcomes(self):
         chosen = {"kind": "delegate", "action": "specialist", "params": {"mode": "author", "focus": "attention"}}
         specialist = {"kind": "propose_action", "action": "integrate_patch", "params": {"candidate": {

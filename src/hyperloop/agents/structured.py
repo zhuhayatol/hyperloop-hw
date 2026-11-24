@@ -163,6 +163,16 @@ def project_context(
 ) -> dict[str, Any]:
     """Project local context into an explicit outbound schema for one role."""
     allowed = {key for key in task.get("allowed_parameters", []) if isinstance(key, str) and _LABEL.fullmatch(key)}
+    if role == "specialist" and isinstance(context.get("startup_failure"), Mapping):
+        failure = context["startup_failure"]
+        return {
+            "role": role, "phase": "ENABLEMENT",
+            "startup_failure": {
+                **_safe_labels(failure, ("code", "assertion")),
+                **_selected_numbers(failure, ("chunked_prefill_size", "page_size")),
+            },
+            "allowed_parameters": sorted(allowed & {"chunked_prefill_size"}),
+        }
     current = context.get("current_revision") or {}
     baseline = context.get("baseline") or {}
     updates = _parameters(current.get("parameters"), allowed)
@@ -242,10 +252,25 @@ def _candidate(spec: Any, *, patch: bool, excerpts: list[dict[str, str]]) -> dic
     }
 
 
-def parse_intents(raw: Any, role: str, excerpts: list[dict[str, str]]) -> list[dict[str, Any]]:
+def parse_intents(
+    raw: Any, role: str, excerpts: list[dict[str, str]], *, startup_repair: bool = False,
+) -> list[dict[str, Any]]:
     """Parse one JSON object into strict role intents for the local Router."""
     if not _keys(raw, ("intents",)) or not isinstance(raw["intents"], list) or len(raw["intents"]) > 8:
         raise InvalidAgentResponse
+    if startup_repair:
+        if role != "specialist" or len(raw["intents"]) > 1:
+            raise InvalidAgentResponse
+        for row in raw["intents"]:
+            if (
+                not _keys(row, ("kind", "parameters", "reason")) or row["kind"] != "repair_startup"
+                or not _keys(row["parameters"], ("chunked_prefill_size",))
+                or type(row["parameters"]["chunked_prefill_size"]) is not int
+                or not 0 < row["parameters"]["chunked_prefill_size"] < 10**9
+                or not _short_text(row["reason"])
+            ):
+                raise InvalidAgentResponse
+        return raw["intents"]
     intents = []
     for row in raw["intents"]:
         if not isinstance(row, dict):

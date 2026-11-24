@@ -63,6 +63,13 @@ Valid intents:
 """ + _TUNING,
 }
 
+_STARTUP_REPAIR_PROMPT = """Diagnose the supplied verified SGLang startup assertion. Choose the smallest absolute
+change to the allowed chunked_prefill_size that satisfies the reported page alignment while remaining positive.
+Keep all other settings. This is a startup repair only. Return one intent if supported by the observed assertion:
+{"intents":[{"kind":"repair_startup","parameters":{"chunked_prefill_size":...},"reason":"diagnosis and rationale"}]}.
+Replace the ellipsis with your chosen integer. Use {"intents":[]} if the evidence cannot justify a repair.
+"""
+
 
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -143,6 +150,7 @@ class DeepSeekAgentBackend:
         if not key or any(not 33 <= ord(char) <= 126 for char in key):
             self._fail(receipt, "missing_or_invalid_api_key")
         projected = project_context(role, context, self._task, self._target, self._excerpts)
+        startup_repair = role == "specialist" and "startup_failure" in projected
         user_data = json_bytes(projected)
         if key.encode("ascii") in user_data:
             self._fail(receipt, "credential_detected_in_context")
@@ -152,7 +160,9 @@ class DeepSeekAgentBackend:
         data = json_bytes({
             "model": self._config["model"], "thinking": {"type": "disabled"}, "stream": False,
             "response_format": {"type": "json_object"}, "max_tokens": 4096, "temperature": 0.1,
-            "messages": [{"role": "system", "content": _PROMPT + _ROLE_PROMPTS[role]},
+            "messages": [{"role": "system", "content": _PROMPT + (
+                _STARTUP_REPAIR_PROMPT if startup_repair else _ROLE_PROMPTS[role]
+            )},
                          {"role": "user", "content": user_data.decode("utf-8")}],
         })
         request = Request(_ENDPOINT, data, {"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
@@ -160,7 +170,7 @@ class DeepSeekAgentBackend:
         start = time.monotonic()
         try:
             raw = self._request(request, receipt)
-            intents = self._parse(raw, role, key, receipt)
+            intents = self._parse(raw, role, key, receipt, startup_repair=startup_repair)
         finally:
             receipt["elapsed_ms"] = round(1000 * (time.monotonic() - start))
         receipt.update(status="ok", intent_count=len(intents))
@@ -188,7 +198,9 @@ class DeepSeekAgentBackend:
         except (OSError, HTTPException):
             self._fail(receipt, "transport_error")
 
-    def _parse(self, raw: bytes, role: str, key: str, receipt: dict[str, Any]) -> list[dict[str, Any]]:
+    def _parse(
+        self, raw: bytes, role: str, key: str, receipt: dict[str, Any], *, startup_repair: bool = False,
+    ) -> list[dict[str, Any]]:
         if len(raw) > _MAX_RESPONSE_BYTES:
             self._fail(receipt, "response_too_large")
         try:
@@ -219,7 +231,7 @@ class DeepSeekAgentBackend:
             if len(content) <= 12_000:
                 receipt["response_content"] = content
             output = _load_response(content)
-            intents = parse_intents(output, role, self._excerpts)
+            intents = parse_intents(output, role, self._excerpts, startup_repair=startup_repair)
             if key.encode("ascii") in json_bytes(intents):
                 receipt.pop("response_content", None)
                 self._fail(receipt, "credential_detected_in_response")
