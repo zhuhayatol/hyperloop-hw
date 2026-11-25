@@ -44,10 +44,15 @@ _ROLE_PROMPTS = {
 {"kind":"delegate","action":"explore","params":{"candidates":[...]}}
 {"kind":"delegate","action":"specialist","params":{"mode":"author","focus":"the narrow focus"}}
 Specialist focus must be a single line of 128 characters or fewer.
+Use review_feedback and its measured review_evidence, when available, to address unresolved review concerns
+or investigate another supported direction.
 {"kind":"escalate_strategy_change","next_action_hint":"skip_to_kernel"} (also skip_to_sweep).
 """ + _TUNING,
     "critic": """Review pending proposal quality before dispatch. A review does not accept an optimization.
 Check bounded scope, available evidence, potential regressions and independent validation.
+With review_evidence, address the prior review concern using the measured cases and sampling variation.
+For rope_layout, positive net_gain_us means faster after including copy time. Check outputs_match and use
+these measurements for review decisions. End-to-end service validation still decides acceptance.
 Return at most one verdict per supplied proposal, using its exact ID. Valid intent:
 {"kind":"review_verdict","proposal_id":"proposal-0001","verdict":"approve","reason":"rationale"}.
 Allowed verdicts are approve, advise, reject and needs_review. Approve and advise both allow dispatch.
@@ -55,6 +60,7 @@ Allowed verdicts are approve, advise, reject and needs_review. Approve and advis
     "specialist": """Follow the scoped assignment. Propose the smallest justified framework change for review.
 For a source change, select one supplied source excerpt ID and produce only the exact replacement block.
 When no suitable excerpt exists, propose a bounded parameter experiment or return an empty list.
+For a single patch intent, close the candidate, params, and intent objects before closing the intents array.
 Valid intents:
 {"kind":"propose_action","action":"integrate_patch","params":{"candidate":{"id":"candidate-id",
 "source_excerpt_id":"given-id","replacement":"the exact replacement block","reason":"mechanism",
@@ -94,6 +100,26 @@ def _invalid_constant(_value: str) -> None:
 
 def _load_response(raw: bytes | str) -> Any:
     return json.loads(raw, object_pairs_hook=_unique_keys, parse_constant=_invalid_constant)
+
+
+def _load_specialist_reply(content: str, receipt: dict[str, Any]) -> Any:
+    """Recover the single missing brace observed in complete patch replies."""
+    try:
+        return _load_response(content)
+    except json.JSONDecodeError as error:
+        offset = error.pos
+        if error.msg != "Expecting ',' delimiter" or not re.fullmatch(r"\]\s*\}\s*", content[offset:]):
+            raise
+        output = _load_response(content[:offset] + "}" + content[offset:])
+        intents = output.get("intents") if isinstance(output, dict) else None
+        if not isinstance(intents, list) or len(intents) != 1 or not isinstance(intents[0], dict):
+            raise
+        if set(output) != {"intents"} or (intents[0].get("kind"), intents[0].get("action")) != (
+            "propose_action", "integrate_patch"
+        ):
+            raise
+        receipt["response_json_repair"] = {"kind": "missing_intent_closing_brace", "offset": offset}
+        return output
 
 
 def provider_config(provider: str, model: str | None = None) -> dict[str, str]:
@@ -230,7 +256,10 @@ class DeepSeekAgentBackend:
                 self._fail(receipt, "credential_detected_in_response")
             if len(content) <= 12_000:
                 receipt["response_content"] = content
-            output = _load_response(content)
+            if role == "specialist" and not startup_repair:
+                output = _load_specialist_reply(content, receipt)
+            else:
+                output = _load_response(content)
             intents = parse_intents(output, role, self._excerpts, startup_repair=startup_repair)
             if key.encode("ascii") in json_bytes(intents):
                 receipt.pop("response_content", None)

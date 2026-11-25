@@ -11,6 +11,7 @@ from ..contracts import ContractError
 from ..evaluation import Evaluator
 from ..evaluation.adjudication import adjudicate, native_operator_publication
 from ..evaluation.evidence import EvidenceProblem
+from ..evaluation.goal import goal_checks
 from ..evaluation.measurements import change_ratios
 from ..kernel.ascend_geak import run_ascend_geak
 from ..kernel.routes import plan_kernel_handoff
@@ -162,11 +163,23 @@ class RuntimeActions:
             if decisions[-1]["reason"] == "cleanup_unconfirmed":
                 break
         qualified = [item for item in decisions if item["version_action"] == "KEEP"]
-        if qualified:
-            first = max(qualified, key=lambda item: item["measurement"]["summary"]["throughput"])
+        if len(qualified) > 1:
+            goals = self.task.get("goals")
+            scores: dict[str, tuple[bool, float]] = {}
             for decision in qualified:
-                if decision is not first:
-                    decision.update(version_action="HOLD", reason="stronger_candidate_selected")
+                checked = adjudicate(self.store, decision, state["baseline"], self.rules) if goals else decision
+                if checked["version_action"] != "KEEP":
+                    continue
+                meets_goals = bool(goals) and all(
+                    goal_checks(checked["comparison"]["over_original"], goals, self.rules).values()
+                )
+                scores[decision["candidate_id"]] = (meets_goals, checked["measurement"]["summary"]["throughput"])
+            if scores:
+                winner = max(scores, key=scores.__getitem__)
+                for decision in qualified:
+                    candidate_id = decision["candidate_id"]
+                    if candidate_id != winner and candidate_id in scores:
+                        decision.update(version_action="HOLD", reason="stronger_candidate_selected")
         return {"status": "ok", "decisions": decisions}
 
     def integrate(self, task: dict, state: dict) -> dict:

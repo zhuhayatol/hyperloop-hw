@@ -28,10 +28,14 @@ class Response(io.BytesIO):
 
 
 def completion(intents, response_id="chatcmpl-unit-test", finish_reason="stop"):
+    return completion_content(json.dumps({"intents": intents}), response_id, finish_reason)
+
+
+def completion_content(content, response_id="chatcmpl-unit-test", finish_reason="stop"):
     return Response(json.dumps({
         "id": response_id,
         "choices": [{"finish_reason": finish_reason, "message": {
-            "role": "assistant", "content": json.dumps({"intents": intents}), "reasoning_content": REASONING,
+            "role": "assistant", "content": content, "reasoning_content": REASONING,
         }}],
         "usage": {"prompt_tokens": 21, "completion_tokens": 13, "total_tokens": 34,
                   "provider_debug": REASONING},
@@ -73,6 +77,110 @@ class DeepSeekAgentTests(TestCase):
     def evidence(self, coordinator, call):
         self.assertTrue(coordinator.store.verify_evidence(call["evidence"]))
         return read_json(coordinator.store.path / call["evidence"]["path"])
+
+    def h18_backend(self):
+        # h18's two HTTP 200 response_content values and selected request excerpt.
+        fixture = read_json(PROJECT / "tests/fixtures/h18_specialist_responses.json")
+        excerpt = fixture["reviewed_excerpt"]
+        scenario = {**self.scenario, "agent_source_excerpts": [excerpt]}
+        target = {**self.target, "sglang": {**self.target["sglang"], "allowed_source_paths": [excerpt["path"]]}}
+        return build_agent_backend(scenario, self.task, target), fixture
+
+    def test_specialist_recovers_h18_contiguous_patch_and_keeps_raw_reply(self):
+        backend, fixture = self.h18_backend()
+        raw = fixture["contiguous"]["response_content"]
+        offset = fixture["contiguous"]["offset"]
+        complete = raw[:offset] + "}" + raw[offset:]
+        excerpt = fixture["reviewed_excerpt"]
+        before = excerpt["before"]
+        after = before.replace(
+            "        q, k = self.rotary_emb(positions, q, k)\n",
+            "        q = q.contiguous()\n        k = k.contiguous()\n        q, k = self.rotary_emb(positions, q, k)\n",
+        )
+        for content, repair_expected in ((raw, True), (complete, False)):
+            with (
+                self.subTest(repair_expected=repair_expected),
+                patch.dict(os.environ, {"DEEPSEEK_API_KEY": KEY}),
+                patch("hyperloop.agents.deepseek._HTTP.open", return_value=completion_content(content)),
+            ):
+                intent, = backend.run("specialist", {})
+                self.assertEqual((intent["kind"], intent["action"]), ("propose_action", "integrate_patch"))
+                candidate = intent["params"]["candidate"]
+                self.assertEqual(candidate["id"], "qwen2-attn-fused-rope")
+                self.assertEqual(candidate["patch_path"], excerpt["path"])
+                self.assertEqual(candidate["source_edit"], {"before": before, "after": after})
+                receipt = backend.last_receipt
+                self.assertEqual(receipt["response_content"], content)
+                if repair_expected:
+                    self.assertEqual(receipt["response_json_repair"], {
+                        "kind": "missing_intent_closing_brace", "offset": offset,
+                    })
+                else:
+                    self.assertNotIn("response_json_repair", receipt)
+
+    def test_recovered_h18_patch_still_requires_real_change_and_reviewed_excerpt(self):
+        backend, fixture = self.h18_backend()
+        no_change = fixture["unchanged"]
+        unknown_source = fixture["contiguous"]["response_content"].replace(
+            fixture["reviewed_excerpt"]["id"], "unreviewed-excerpt", 1,
+        )
+        for content, offset in (
+            (no_change["response_content"], no_change["offset"]), (unknown_source, len(unknown_source) - 2),
+        ):
+            with (
+                self.subTest(offset=offset),
+                patch.dict(os.environ, {"DEEPSEEK_API_KEY": KEY}),
+                patch("hyperloop.agents.deepseek._HTTP.open", return_value=completion_content(content)),
+            ):
+                with self.assertRaisesRegex(AgentInvocationError, "invalid_structured_response") as error:
+                    backend.run("specialist", {})
+                receipt = error.exception.receipt
+                self.assertEqual(receipt["response_content"], content)
+                self.assertEqual(receipt["response_json_repair"], {
+                    "kind": "missing_intent_closing_brace", "offset": offset,
+                })
+
+    def test_json_recovery_rejects_unrelated_roles_actions_and_intent_bundles(self):
+        backend, fixture = self.h18_backend()
+        raw = fixture["contiguous"]["response_content"]
+        cases = {
+            "role": ("orchestration", raw),
+            "action": ("specialist", raw.replace('"action":"integrate_patch"', '"action":"explore"', 1)),
+            "bundle": ("specialist", raw.replace('{"intents":[', '{"intents":[{"kind":"unrelated"},', 1)),
+        }
+        for name, (role, content) in cases.items():
+            with (
+                self.subTest(case=name),
+                patch.dict(os.environ, {"DEEPSEEK_API_KEY": KEY}),
+                patch("hyperloop.agents.deepseek._HTTP.open", return_value=completion_content(content)),
+            ):
+                with self.assertRaisesRegex(AgentInvocationError, "invalid_structured_response") as error:
+                    backend.run(role, {})
+                receipt = error.exception.receipt
+                self.assertEqual(receipt["response_content"], content)
+                self.assertNotIn("response_json_repair", receipt)
+
+    def test_specialist_sends_and_records_verbatim_h16_assignment_focus(self):
+        # Frozen from h16 task_queued events so this regression needs no local run archive.
+        focuses = {
+            48: "Profile prefill matmul/RoPE/RMSNorm hotspots; propose NPU kernel or fusion patch for Qwen2.5-0.5B",
+            117: "NPU attention backend: reduce PagedAttentionMaskNdKernel/decode mask overhead",
+            148: "NPU attention backend: reduce PagedAttentionMaskNdKernel decode overhead (mask/prefix-cache path)",
+        }
+        backend = build_agent_backend(self.scenario, self.task, self.target)
+        for event, focus in focuses.items():
+            with (
+                self.subTest(event=event),
+                patch.dict(os.environ, {"DEEPSEEK_API_KEY": KEY}),
+                patch("hyperloop.agents.deepseek._HTTP.open", return_value=completion([])) as transport,
+            ):
+                assignment = {"mode": "author", "focus": focus}
+                self.assertEqual(backend.run("specialist", {"assignment": assignment}), [])
+                transport.assert_called_once()
+                request = transport.call_args.args[0]
+                sent = json.loads(json.loads(request.data)["messages"][1]["content"])
+                self.assertEqual(sent["assignment"], assignment)
+                self.assertEqual(backend.last_receipt["request_context"], sent)
 
     def test_startup_specialist_uses_only_the_projected_assertion_and_accepts_one_parameter(self):
         backend = build_agent_backend(self.scenario, self.task, self.target)

@@ -10,6 +10,7 @@ from statistics import median
 from typing import Any, Callable, Iterator, Mapping
 
 from ..backends import BackendError, RuntimeBackend, fingerprint
+from ..observability import observe_evaluation_step
 from .evidence import AttemptEvidence, EvidenceProblem
 from .measurements import (
     METRIC_DEFINITIONS,
@@ -48,6 +49,7 @@ class _ValidationAttempt(AttemptEvidence):
         if keys:
             row["evidence_keys"] = keys
         self.steps.append(row)
+        observe_evaluation_step(self.attempt_id, row)
 
     @contextmanager
     def exchange(

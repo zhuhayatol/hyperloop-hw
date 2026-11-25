@@ -22,6 +22,7 @@ _ACTION_RESOURCES = {
     "targeted_build": ("workspace",),
     "enablement": ("benchmark", "workspace"),
     "integrate_patch": ("benchmark", "workspace"),
+    "rope_layout_probe": ("benchmark", "workspace"),
     "integrate": ("benchmark", "workspace"),
     "kernel_agent": ("benchmark", "workspace"),
 }
@@ -32,14 +33,18 @@ _FAILED_RESULTS = frozenset({"failure", "failed", "error", "interrupted", "cance
 class Dispatcher:
     """Account for tasks and lease resources without invoking an execution backend."""
 
-    def __init__(self, capacities: Mapping[str, int] | None = None, emit: EventSink | None = None) -> None:
+    def __init__(self, capacities: Mapping[str, int] | None = None, emit: EventSink | None = None,
+                 *, reserved_task_numbers: int = 0) -> None:
         self._capacities = {**_DEFAULT_CAPACITIES, **(capacities or {})}
         if any(type(count) is not int or count < 0 for count in self._capacities.values()):
             raise ValueError("resource capacities must be nonnegative integers")
         self._emit = emit
         self._tasks: dict[str, dict[str, Any]] = {}
         self._task_keys: dict[str, str] = {}
-        self._task_counter = 0
+        if type(reserved_task_numbers) is not int or reserved_task_numbers < 0:
+            raise ValueError("reserved task numbers must be a nonnegative integer")
+        self._reserved_task_numbers = reserved_task_numbers
+        self._task_counter = reserved_task_numbers
 
     @property
     def tasks(self) -> dict[str, dict[str, Any]]:
@@ -169,10 +174,11 @@ class Dispatcher:
     def restore(self, snapshot: Mapping[str, Any]) -> None:
         tasks = deepcopy(dict(snapshot["tasks"]))
         counter = snapshot["task_counter"]
-        expected_ids = [f"task-{index:04d}" for index in range(1, counter + 1)] if type(counter) is int else []
+        start = self._reserved_task_numbers + 1
+        expected_ids = [f"task-{index:04d}" for index in range(start, counter + 1)] if type(counter) is int else []
         if (
             type(counter) is not int
-            or counter != len(tasks)
+            or counter - self._reserved_task_numbers != len(tasks)
             or tasks.keys() != set(expected_ids)
             or any(task["task_id"] != task_id for task_id, task in tasks.items())
         ):

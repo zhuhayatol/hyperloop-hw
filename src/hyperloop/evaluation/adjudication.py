@@ -212,11 +212,11 @@ def native_operator_publication(store: SessionStore, parent: str, kernel: Record
     return {"reference": reference, "compiled_names": names, "supported_input": supported}
 
 
-def _verify_native_activation(proof: _AttemptProof, instance: Record, parent: str) -> Record:
+def _verify_native_activation(proof: _AttemptProof, instance: Record, parent: str, *, arm: str = "candidate") -> Record:
     try:
         kernel = instance["loaded_stack"]["kernels"][-1]
         verified = native_operator_publication(proof.store, parent, kernel)
-        observed = proof.read("candidate_service_outputs", "runtime_backend")["kernel_activation"]
+        observed = proof.read(f"{arm}_service_outputs", "runtime_backend")["kernel_activation"]
         source = instance["source_overlay"]
         file = next(item for item in source["files"] if item["path"] == kernel["patch_path"])
         loaded = next(item for item in source["loaded_files"] if item["path"] == file["staged_path"])
@@ -260,6 +260,30 @@ def _measure(
     if proof.read(f"{arm}_measurement", "evaluation") != computed:
         raise EvidenceProblem(f"adjudication_measurement_mismatch:{arm}")
     return computed
+
+
+def verify_service_retest(
+    store: SessionStore, attempt: Record, revision: Record, *, forge_parent: str | None = None,
+) -> Record:
+    """Recompute a fresh service arm against its frozen workload and loaded stack."""
+    manifest = store.manifest
+    reference = manifest["reference"]
+    rules = EvaluationPolicy.load(manifest["task"]["rules"])
+    proof = _AttemptProof(store, attempt)
+    context = _context(proof, manifest, rules, {"verify", "benchmark"}, reference)
+    if context["environment_fingerprint"] != manifest["runtime"]["environment_fingerprint"]:
+        raise EvidenceProblem("goal_retest_environment_changed", "incomparable")
+    instance = _instance(proof, context, revision, "revision", "framework")
+    checked = _verify(proof, context, instance, rules, reference, "revision")
+    kernels = revision["kernels"]
+    if manifest["mode"] == "real" and kernels and kernels[-1].get("kind") == "operator_patch":
+        if forge_parent is None:
+            raise EvidenceProblem("goal_retest_forge_origin_missing", "missing", "partial")
+        _verify_native_activation(proof, instance, forge_parent, arm="revision")
+    return {
+        "instance_id": instance["instance_id"], "correctness": checked,
+        "measurement": _measure(proof, context, instance, rules, "revision") if checked["pass"] else None,
+    }
 
 
 def _device(proof: _AttemptProof, context: Record, instance: Record) -> Record:

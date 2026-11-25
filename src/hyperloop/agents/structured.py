@@ -13,7 +13,12 @@ from ..contracts import ContractError, safe_id
 _RATIONALE = ("reason", "expected_metric", "risk", "validation")
 _METRICS = ("throughput", "ttft_ms", "tpot_ms")
 _DELTAS = ("throughput_pct", "ttft_pct", "tpot_pct")
+_ROPE_LAYOUT_METRICS = (
+    "tokens", "sample_count", "split_rope_us", "contiguous_rope_us", "copy_us",
+    "copy_plus_rope_us", "rope_gain_us", "net_gain_us", "net_p25_us", "net_p75_us",
+)
 _CODE_LIMIT = 2400
+_FOCUS_LIMIT = 128
 _SOURCE_PATH = re.compile(r"(?:python/)?sglang/[A-Za-z0-9_./-]+\.py")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+ -]{0,127}")
 
@@ -153,8 +158,55 @@ def _reviews(raw: Mapping[str, Any], allowed: set[str]) -> list[dict[str, Any]]:
                                           if isinstance(edit.get(key), str)}
             candidates.append(row)
         fields["candidates"] = candidates
+        evidence = _review_evidence(proposal.get("review_evidence"))
+        if evidence is not None:
+            fields["review_evidence"] = evidence
         reviews.append(fields)
     return reviews
+
+
+def _review_evidence(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    summary = raw.get("summary")
+    evidence_ref = raw.get("evidence_ref")
+    prior = raw.get("prior_review")
+    if (
+        not isinstance(summary, Mapping) or summary.get("kind") != "rope_layout"
+        or summary.get("mode") not in ("real", "simulated") or not isinstance(summary.get("cases"), list)
+        or not isinstance(evidence_ref, Mapping) or not isinstance(prior, Mapping)
+    ):
+        return None
+    boundary = _safe_labels(summary, ("boundary",)).get("boundary")
+    evidence_id = _safe_labels(evidence_ref, ("id",)).get("id")
+    if boundary is None or evidence_id is None:
+        return None
+    cases = []
+    for case in summary["cases"][:8]:
+        if not isinstance(case, Mapping):
+            continue
+        numbers = _selected_numbers(case, _ROPE_LAYOUT_METRICS)
+        if len(numbers) != len(_ROPE_LAYOUT_METRICS) or type(case.get("outputs_match")) is not bool:
+            continue
+        projected = {**_safe_labels(case, ("phase", "layout_source")), **numbers,
+                     "outputs_match": case["outputs_match"]}
+        for key in ("q_stride", "k_stride"):
+            stride = case.get(key)
+            if isinstance(stride, list) and 0 < len(stride) <= 8 and all(
+                type(value) is int and abs(value) < 1e12 for value in stride
+            ):
+                projected[key] = stride
+        cases.append(projected)
+    if not cases:
+        return None
+    prior_review = _safe_labels(prior, ("reviewer", "verdict"))
+    if _short_text(prior.get("reason")):
+        prior_review["reason"] = prior["reason"]
+    return {
+        "evidence_id": evidence_id,
+        "summary": {"kind": "rope_layout", "mode": summary["mode"], "boundary": boundary, "cases": cases},
+        "prior_review": prior_review,
+    }
 
 
 def project_context(
@@ -200,13 +252,48 @@ def project_context(
     }
     if "agent_objective" in task:
         data["agent_objective"] = task["agent_objective"]
+    if isinstance(task.get("goals"), Mapping):
+        data["goals"] = _selected_numbers(task["goals"], ("throughput_gain_pct", "ttft_reduction_pct"))
+    direction = context.get("direction_change")
+    if role == "orchestration" and isinstance(direction, Mapping):
+        data["direction_change"] = {
+            **_safe_labels(direction, ("reason", "tested_direction")),
+            **{key: [value for value in direction.get(key, [])[:8]
+                     if isinstance(value, str) and _LABEL.fullmatch(value)]
+               for key in ("mechanism", "tested_candidates", "alternatives")},
+            "instruction": "Investigate a different supported cause or obtain evidence that distinguishes it before repeating the same approach.",
+        }
     if role == "critic":
         data["pending_proposals"] = _reviews(context.get("pending_proposals", {}), allowed)
     elif role == "specialist":
-        data["assignment"] = _safe_labels(context.get("assignment", {}), ("mode", "focus"))
+        assignment = context.get("assignment", {})
+        data["assignment"] = _safe_labels(assignment, ("mode",))
+        focus = assignment.get("focus")
+        if _short_text(focus, _FOCUS_LIMIT):
+            data["assignment"]["focus"] = focus
         data["source_excerpts"] = excerpts
     else:
         data["source_excerpt_paths"] = sorted({row["path"] for row in excerpts})
+        feedback = []
+        for row in context.get("review_feedback", [])[-8:]:
+            if not isinstance(row, Mapping) or row.get("status") not in ("needs_review", "reject"):
+                continue
+            entry = _safe_labels(row, (
+                "proposal_id", "source", "action", "status", "parent", "evidence_status", "evidence_reason",
+            ))
+            if _short_text(row.get("reason")):
+                entry["reason"] = row["reason"]
+            entry["candidate_ids"] = [
+                value for value in row.get("candidate_ids", [])[:4]
+                if isinstance(value, str) and _LABEL.fullmatch(value)
+            ]
+            evidence = _review_evidence(row.get("review_evidence"))
+            if evidence is not None:
+                entry["review_evidence"] = evidence
+            if "proposal_id" in entry:
+                feedback.append(entry)
+        if feedback:
+            data["review_feedback"] = feedback
     recipe = context.get("recipe") or {}
     if recipe.get("status") == "applicable":
         data["recipe_suggestions"] = _parameters(recipe.get("parameters"), allowed)
@@ -302,7 +389,10 @@ def parse_intents(
                 if not _keys(params, ("candidate",)):
                     raise InvalidAgentResponse
                 params = {"candidate": _candidate(params["candidate"], patch=True, excerpts=excerpts)}
-            elif not _keys(params, ("mode", "focus")) or params["mode"] != "author" or not _short_text(params["focus"], 128):
+            elif (
+                not _keys(params, ("mode", "focus")) or params["mode"] != "author"
+                or not _short_text(params["focus"], _FOCUS_LIMIT)
+            ):
                 raise InvalidAgentResponse
             row = {**row, "params": params}
         else:

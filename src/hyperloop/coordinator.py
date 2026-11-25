@@ -9,14 +9,18 @@ from uuid import uuid4
 
 from .actions.enablement import accept_startup_repair, observed_startup_failure
 from .actions.knowledge import RECIPE_PATH, build_recipe, validate_recipe
+from .actions.review_evidence import ROPE_ACTION, collect_rope_evidence, is_rope_layout_edit
 from .actions.runtime import RuntimeActions, accepted_revision
 from .agents import AgentInvocationError, build_agent_backend
 from .artifacts import publish_indexes
 from .backends import RuntimeBackend
 from .backends.factory import RuntimeBackendFactory, build_runtime, checked_probe
+from .baseline import latest_baseline
 from .contracts import ContractError, digest, read_json, safe_id, validate_reference, validate_target, validate_task
 from .dispatcher import Dispatcher
 from .evaluation.adjudication import adjudicate
+from .evaluation.goal import GOAL_RETEST_COST, paired_goal_retest, warrants_retest
+from .phases.direction import direction_change
 from .phases.machine import SWEEP_PAIR_COST, after_framework, after_prelude, after_sweep, should_reprofile, sweep_skip_reason
 from .policy import PolicyGate
 from .report import write_report
@@ -24,27 +28,35 @@ from .router import IntentRouter
 from .session import SessionStore, project
 
 
+_INITIAL_CONTROL = {"spent": 0, "turns": {}, "hints": {}, "review_attempts": {}, "next_turn": 1}
+
+
 class Coordinator:
     @classmethod
     def create(
-        cls, root: Path, session_id: str, task: dict, target: dict, reference: dict, scenario: dict,
-        *, backend_factory: RuntimeBackendFactory | None = None,
+        cls, root: Path, session_id: str, task: dict, target: dict, reference: dict | None, scenario: dict,
+        *, backend_factory: RuntimeBackendFactory | None = None, baseline_history: Path | None = None,
     ) -> Coordinator:
         validate_task(task)
         validate_target(target)
-        validate_reference(reference, task)
+        if baseline_history is None:
+            validate_reference(reference, task)
         agents = build_agent_backend(scenario, task, target)
         if scenario.get("agent_provider", {}).get("provider") == "deepseek":
             scenario = {**scenario, "agent_provider": agents.snapshot()}
         backend = build_runtime(target, scenario, task["initial_revision"], backend_factory)
         runtime = checked_probe(backend, target, mode=target["mode"])
+        historical = None
+        if baseline_history is not None:
+            historical = latest_baseline(baseline_history, task, target, runtime, scenario)
+            reference = historical.reference
         capture = scenario.get("reference_capture")
         if capture is not None and (
             not isinstance(capture, dict)
             or capture.get("environment_fingerprint") != runtime["environment_fingerprint"]
         ):
             raise ContractError("reference capture environment does not match the runtime probe")
-        store = SessionStore.create(root, target["mode"], session_id, {
+        fields = {
             "task": task, "target": target, "reference": reference, "scenario": scenario,
             "runtime": runtime,
             "contributions": {
@@ -54,8 +66,20 @@ class Coordinator:
                                  if target["mode"] == "simulated" else "所选运行端采集，独立评测程序复算"),
                 "third_party": "Hyperloom 1.1.5 行为参考",
             },
-        })
-        return cls(store, _backend=backend)
+        }
+        if historical is not None:
+            fields["baseline_reuse"] = {**historical.provenance,
+                                        "reserved_task_numbers": historical.last_task_number}
+        store = SessionStore.create(root, target["mode"], session_id, fields)
+        coordinator = cls(store, _backend=backend)
+        if historical is not None:
+            with store.execution_lease():
+                historical.copy_evidence(store)
+                coordinator._record_baseline(historical.baseline, historical.provenance)
+                if historical.profile is not None:
+                    coordinator._emit("profile_recorded", {**historical.profile, "reused_from": historical.provenance})
+                coordinator._checkpoint()
+        return coordinator
 
     @classmethod
     def open(cls, path: Path, *, backend_factory: RuntimeBackendFactory | None = None) -> Coordinator:
@@ -70,6 +94,7 @@ class Coordinator:
         self.store = store
         self.task = store.manifest["task"]
         self.settings = self.task["settings"]
+        self.goals = self.task.get("goals")
         self.scenario = store.manifest["scenario"]
         self.backend = _backend if _backend is not None else build_runtime(
             store.manifest["target"], self.scenario, self.task["initial_revision"], backend_factory,
@@ -79,7 +104,8 @@ class Coordinator:
             bind_session(store.path)
         self.actions = RuntimeActions(store, self.backend)
         self.agents = build_agent_backend(self.scenario, self.task, store.manifest["target"])
-        self.dispatcher = Dispatcher(emit=self._emit)
+        self.dispatcher = Dispatcher(emit=self._emit, reserved_task_numbers=store.manifest.get(
+            "baseline_reuse", {}).get("reserved_task_numbers", 0))
         self.router = IntentRouter(
             PolicyGate(store.path / "workspaces", self.task.get("allowed_parameters")),
             self.dispatcher,
@@ -87,7 +113,8 @@ class Coordinator:
         )
         self.state: dict[str, Any] = {}
         self._events: list[tuple[str, dict]] = []
-        self._control: dict[str, Any] = {}
+        self._control: dict[str, Any] = deepcopy(_INITIAL_CONTROL)
+        self.observer = None
 
     def _runtime_probe(self) -> dict:
         manifest = self.store.manifest
@@ -95,10 +122,10 @@ class Coordinator:
 
     def _restore(self) -> None:
         self.state = self.store.state()
+        if self.store.manifest.get("baseline_reuse") and self.state["baseline"] is None:
+            raise ContractError("historical baseline import did not finish; start a new Session")
         checkpoint = self.state["control"]
-        self._control = deepcopy(checkpoint.get("coordinator", {
-            "spent": 0, "turns": {}, "hints": {}, "review_attempts": {}, "next_turn": 1,
-        }))
+        self._control = deepcopy(checkpoint.get("coordinator", _INITIAL_CONTROL))
         if isinstance(self._control["review_attempts"], list):
             self._control["review_attempts"] = {
                 digest(bundle): 1 for bundle in self._control["review_attempts"]
@@ -119,6 +146,8 @@ class Coordinator:
         })
         self.state = self.store.commit(self._events)
         self._events.clear()
+        if self.observer is not None:
+            self.observer.checkpoint(self.store, self.state)
 
     def run(self, max_steps: int | None = None) -> dict:
         if max_steps is not None and (type(max_steps) is not int or max_steps < 1):
@@ -128,10 +157,20 @@ class Coordinator:
             self._restore()
             steps = 0
             while self.state["phase"] != "DONE" and (max_steps is None or steps < max_steps):
-                if not self._tick():
+                try:
+                    if not self._tick():
+                        break
+                except AgentInvocationError as error:
+                    if self.goals is None:
+                        raise
+                    self._emit("run_blocked", {
+                        "phase": self.phase, "cycle": self.cycle, "reason": error.receipt["reason"],
+                        "call_id": error.receipt["call_id"], "role": error.receipt["role"],
+                    })
+                    self._checkpoint()
                     break
                 steps += 1
-            if self.state["phase"] == "DONE":
+            if self.state["phase"] == "DONE" or self.observer is not None or self.goals is not None:
                 self.report()
             return deepcopy(self.state)
 
@@ -205,10 +244,16 @@ class Coordinator:
                     producer="action_executor",
                 )
                 self._finish_task(task, result, receipt)
-                if result.get("agent_failure"):
-                    raise AgentInvocationError(result["agent_failure"])
                 if self.dispatcher.get(task["task_id"])["status"] == "cleanup_pending":
                     break
+                failure = result.get("agent_failure")
+                retryable = result.get("reason") == "forge_worker_timeout" or (
+                    failure is not None and self._retryable_api(failure)
+                )
+                if self.goals is not None and retryable and self._queue_retry(task, result["reason"]):
+                    self._checkpoint()
+                elif failure:
+                    raise AgentInvocationError(failure)
         else:
             self._advance_phase()
             self._checkpoint()
@@ -230,26 +275,42 @@ class Coordinator:
                 receipt = self.store.put_evidence(self._receipt(task), data, producer="action_executor")
                 cleanup = self.backend.recover_cleanup()
                 if not cleanup["released"]:
-                    return False
+                    return self._wait_for_cleanup(task, cleanup)
                 self._emit("task_recovered", {"task_id": task["task_id"], "receipt": receipt, "cleanup": cleanup})
                 self._finish_task(task, data["result"], receipt, recovered_cleanup=True)
                 continue
 
             cleanup = self.backend.recover_cleanup()
             if not cleanup["released"]:
-                return False
+                return self._wait_for_cleanup(task, cleanup)
             result = {"status": "interrupted", "reason": "interrupted_before_action_receipt"}
             settled = self.dispatcher.settle(task["task_id"], result, cleanup=True)
             self.router.record_task_result(settled)
-            if not task["params"].get("retry_of") and self.budget >= task["estimated_seconds"]:
-                self.dispatcher.enqueue(
-                    task["action"], {**task["params"], "retry_of": task["task_id"]},
-                    source=task["source"], proposal_id=task["proposal_id"], phase=self.phase,
-                    idempotency_key=f"retry:{task['task_id']}",
-                )
+            self._queue_retry(task, result["reason"])
             self._emit("task_recovered", {"task_id": task["task_id"], "cleanup": cleanup, **result})
             self._checkpoint()
         return True
+
+    def _queue_retry(self, task: dict, reason: str) -> bool:
+        if task["params"].get("retry_of") or self.budget < task["estimated_seconds"]:
+            return False
+        retry = self.dispatcher.enqueue(
+            task["action"], {**task["params"], "retry_of": task["task_id"]},
+            source=task["source"], proposal_id=task["proposal_id"], phase=task["phase"],
+            idempotency_key=f"retry:{task['task_id']}",
+        )
+        if self.goals is not None or self.observer is not None:
+            self._emit("task_retry_scheduled", {
+                "task_id": task["task_id"], "action": task["action"], "retry_task_id": retry["task_id"],
+                "reason": reason,
+            })
+        return True
+
+    def _wait_for_cleanup(self, task: dict, cleanup: dict) -> bool:
+        if self.goals is not None or self.observer is not None:
+            self._emit("task_cleanup_wait", {"task_id": task["task_id"], "action": task["action"], "cleanup": cleanup})
+            self._checkpoint()
+        return False
 
     def _execute_task(self, task: dict) -> dict:
         action = task["action"]
@@ -264,6 +325,7 @@ class Coordinator:
                 return {"status": "ok", "fix": fix, "reason": "suggested_fix" if fix else "no_enablement_candidate"}
             context = self._context("specialist")
             context["assignment"] = task["params"]
+            self._agent_provider_started("specialist", task_id=task["task_id"])
             try:
                 responses = self.agents.run("specialist", context)
             except AgentInvocationError as error:
@@ -276,6 +338,16 @@ class Coordinator:
                     "profile": {"report_ref": (context["profile"] or {}).get("report_ref")},
                 }
             return result
+        if action == "stack_revalidate" and task["params"].get("reason") == "goal_revalidate":
+            self._runtime_probe()
+            assessment = paired_goal_retest(self.actions, self.state, task["task_id"], self.goals or {})
+            return {
+                "status": "failed" if assessment["status"] == "incomplete" else "ok",
+                "reason": assessment["reason"], "revision": assessment["revision"], "goal_assessment": assessment,
+            }
+        if action == ROPE_ACTION:
+            self._runtime_probe()
+            return collect_rope_evidence(self.store, self.backend, task, self.state)
         run = {
             "baseline": self.actions.baseline, "enablement": self.actions.enablement,
             "profile": self.actions.profile,
@@ -297,6 +369,7 @@ class Coordinator:
         if failure is None:
             return {"status": "ok", "fix": None, "reason": "no_supported_startup_failure"}
         context = {"startup_failure": failure}
+        self._agent_provider_started("specialist", task_id=task["task_id"])
         try:
             responses = self.agents.run("specialist", context)
         except AgentInvocationError as error:
@@ -344,22 +417,31 @@ class Coordinator:
                                  call=result.get("agent_call"))
         elif action in ("baseline", "enablement"):
             if result.get("acceptance") == "pass":
-                current = {
-                    **result["revision"], "summary": result["measurement"]["summary"],
-                    "validation_ref": result["evidence"]["revision_measurement"],
-                }
-                self._emit("baseline_recorded", {"result": result, "revision": current})
+                self._record_baseline(result)
             else:
                 self._emit("baseline_failure", {**result, **common})
         elif action == "profile":
             self._emit("profile_recorded", {**result, **common})
+        elif action == ROPE_ACTION:
+            self._record_review_evidence(task, result, common)
         elif action == "conc_sweep":
             self._emit("sweep_recorded", {**result, **common})
         elif action == "stack_revalidate":
-            self._emit("stack_validated", {**result, **common})
+            if "goal_assessment" in result:
+                self._record_goal(result["goal_assessment"], task["task_id"], common)
+            else:
+                self._emit("stack_validated", {**result, **common})
         elif action in ("explore", "integrate_patch", "kernel_agent"):
             self._candidate_results(task, result, common)
         self._checkpoint()
+
+    def _record_baseline(self, result: dict, reused_from: dict | None = None) -> None:
+        current = {
+            **result["revision"], "summary": result["measurement"]["summary"],
+            "validation_ref": result["evidence"]["revision_measurement"],
+        }
+        provenance = {"reused_from": reused_from} if reused_from is not None else {}
+        self._emit("baseline_recorded", {"result": result, "revision": current, **provenance})
 
     @staticmethod
     def _decision_summary(row: dict) -> dict:
@@ -449,12 +531,16 @@ class Coordinator:
         }
         return {
             "phase": self.phase, "cycle": self.cycle, "budget": self.budget,
-            "goal": self.settings["target_gain_pct"], "current_revision": self.state["current_revision"],
+            "goal": self.goals["throughput_gain_pct"] if self.goals else self.settings["target_gain_pct"],
+            "current_revision": self.state["current_revision"],
             "baseline": baseline_summary, "profile": profile_summary,
             "decisions": [self._decision_summary(row) for row in self.state["decisions"]],
             "inbox": self.router.inbox_for(role), "pending_proposals": self.router.pending_proposals,
+            **({"review_feedback": self._review_feedback()} if role == "orchestration"
+               and self.goals is not None else {}),
             "last_conc_sweep": sweep_summary,
             "recipe": self.state["retrieved_recipe"],
+            **({"direction_change": self.state["direction_changes"][-1]} if self.state["direction_changes"] else {}),
         }
 
     def _start_turn(self, role: str, context: dict, task_id: str | None, call: dict | None,
@@ -497,16 +583,45 @@ class Coordinator:
             self._emit("intent_result", {"turn_id": turn_id, "role": role, "result": routed})
         self._emit("agent_turn_completed", {"turn_id": turn_id, "role": role, "response_count": len(intents)})
 
+    def _agent_provider_started(self, role: str, *, task_id: str | None = None,
+                                retry_of: str | None = None) -> None:
+        if self.observer is None and self.goals is None:
+            return
+        self._emit("agent_provider_started", {
+            "role": role, "phase": self.phase, "cycle": self.cycle, "task_id": task_id,
+            "request_key": f"turn-{self._control['next_turn']:04d}", "retry_of": retry_of,
+            "provider": self.scenario.get("agent_provider", {}).get("provider", "replay"),
+        })
+        self._checkpoint()
+
+    @staticmethod
+    def _retryable_api(failure: dict) -> bool:
+        status = failure.get("http_status")
+        return failure.get("reason") in {
+            "request_timeout", "transport_error", "incomplete_response", "invalid_structured_response",
+        } or (type(status) is int and (status in {408, 429} or 500 <= status < 600))
+
     def _call_role(self, role: str) -> list[dict]:
         context = self._context(role)
-        try:
-            replies = self.agents.run(role, context)
-        except AgentInvocationError as error:
-            self._start_turn(role, context, None, error.receipt, [])
-            self._checkpoint()
-            raise
-        self._route_turn(role, context, replies, call=self.agents.last_receipt)
-        return replies
+        retry_of = None
+        while True:
+            self._agent_provider_started(role, retry_of=retry_of)
+            try:
+                replies = self.agents.run(role, context)
+            except AgentInvocationError as error:
+                identity = self._start_turn(role, context, None, error.receipt, [])
+                if (self.goals is None or retry_of is not None or self.budget < 1
+                        or not self._retryable_api(error.receipt)):
+                    self._checkpoint()
+                    raise
+                retry_of = identity
+                self._emit("task_retry_scheduled", {
+                    "role": role, "retry_of": retry_of, "reason": error.receipt["reason"],
+                })
+                self._checkpoint()
+                continue
+            self._route_turn(role, context, replies, call=self.agents.last_receipt)
+            return replies
 
     def _phase_tasks(self, action: str) -> list[dict]:
         return [
@@ -515,8 +630,8 @@ class Coordinator:
             and task["params"].get("cycle", 1) == self.cycle
         ]
 
-    def _register(self, action: str, *, key: str | None = None, **params: Any) -> None:
-        self.router.register_internal(
+    def _register(self, action: str, *, key: str | None = None, **params: Any) -> dict:
+        return self.router.register_internal(
             self.phase, action, {"cycle": self.cycle, **params},
             idempotency_key=f"{self.phase}:{self.cycle}:{key or action}",
         )
@@ -546,7 +661,7 @@ class Coordinator:
         elif self._profile_due() and not self._phase_tasks("profile"):
             self._register("profile", reason="initial")
         else:
-            if not self._phase_tasks("profile"):
+            if not self._phase_tasks("profile") and self._last_profile() is None:
                 self._emit("profile_skipped", {"reason": "disabled_capability_or_budget", "phase": self.phase})
             self._change_phase(after_prelude(self.settings), "prelude_complete")
 
@@ -596,8 +711,11 @@ class Coordinator:
             revision = self.state["current_revision"]["id"]
             self._register("profile", key=f"profile:{revision}", reason="accepted_gain_or_missing_profile")
             return
-        pending = sorted(self.router.pending_proposals)
-        bundle = digest(pending)
+        proposals = self.router.pending_proposals
+        pending = sorted(proposals)
+        evidence_ids = {key: row["review_evidence"]["evidence_ref"]["id"]
+                        for key, row in proposals.items() if "review_evidence" in row}
+        bundle = digest({"proposals": pending, "evidence": evidence_ids} if evidence_ids else pending)
         attempts = self._control["review_attempts"]
         if (
             pending and attempts.get(bundle, 0) < self.settings["max_turns_per_cycle"]
@@ -606,21 +724,103 @@ class Coordinator:
             self._call_role("critic")
             attempts[bundle] = attempts.get(bundle, 0) + 1
             return
+        if self._schedule_review_evidence():
+            return
         cycle = str(self.cycle)
         count = self._control["turns"].get(cycle, 0)
         hint = self._control["hints"].get(cycle)
+        replan_proposals = self._unresolved_reviews()
+        replans = self._control.setdefault("review_replans", {}) if replan_proposals else {}
+        extra_turn = bool(replan_proposals) and not replans.get(cycle)
         if (
-            not hint and self.budget >= 1 and count < self.settings["max_turns_per_cycle"]
+            not hint and self.budget >= 1 and (count < self.settings["max_turns_per_cycle"] or extra_turn)
             and self.agents.has_next("orchestration")
         ):
+            if pivot := self._new_direction():
+                self._emit("direction_changed", pivot)
+                self._checkpoint()
+            if replan_proposals:
+                self._emit("review_replan", {"phase": self.phase, "cycle": self.cycle,
+                                             "proposal_ids": replan_proposals, "reason": "framework_review_unresolved"})
             self._call_role("orchestration")
             self._control["turns"][cycle] = count + 1
+            if replan_proposals:
+                self._control.setdefault("review_feedback_handled", []).extend(replan_proposals)
+                if count >= self.settings["max_turns_per_cycle"]:
+                    replans[cycle] = True
             return
         if pending:
             self._emit("critic_bundle_unresolved", {"proposal_ids": pending, "cycle": self.cycle})
         else:
             self._emit("critic_skipped", {"reason": "empty_review_bundle", "cycle": self.cycle})
         self._change_phase(after_framework(self.settings), hint or "framework_round_complete")
+
+    def _schedule_review_evidence(self) -> bool:
+        if self.goals is None or self.budget < 3 or ROPE_ACTION not in self.state["runtime"]["capabilities"]:
+            return False
+        revision = self.state["current_revision"]
+        profile = self._last_profile()
+        if (not profile or profile.get("revision") != revision["id"] or revision["framework"] or revision["kernels"]
+                or not self.store.verify_evidence(profile.get("report_ref") or {})):
+            return False
+        profile_ref = profile["report_ref"]
+        if any(task["action"] == ROPE_ACTION and task["params"].get("profile_ref") == profile_ref
+               for task in self.dispatcher.tasks.values()):
+            return False
+        for proposal_id, proposal in self.router.review_evidence_candidates.items():
+            params = proposal["params"]
+            if (proposal["phase"] != self.phase or params.get("parent") != revision["id"]
+                    or params.get("profile_ref") != profile_ref or not is_rope_layout_edit(proposal)):
+                continue
+            task = self._register(ROPE_ACTION, key=f"review:{proposal_id}", proposal_id=proposal_id,
+                                  revision=revision["id"], profile_ref=profile_ref, estimated_seconds=2)
+            self._emit("review_evidence_requested", {
+                "phase": self.phase, "cycle": self.cycle, "proposal_id": proposal_id,
+                "task_id": task["task_id"], "kind": "rope_layout", "reason": proposal["review"]["reason"],
+            })
+            return True
+        return False
+
+    def _record_review_evidence(self, task: dict, result: dict, common: dict) -> None:
+        params = task["params"]
+        proposal_id = params["proposal_id"]
+        ref = result.get("evidence", {}).get("rope_layout")
+        status, reason = result["status"], result["reason"]
+        summary = result.get("summary")
+        valid_ref = ref is not None and self.store.verify_evidence(ref)
+        if status == "ok":
+            raw = read_json(self.store.artifact_path(ref["path"])) if valid_ref else {}
+            if (raw.get("proposal_id") != proposal_id or raw.get("revision") != params["revision"]
+                    or raw.get("profile_ref") != params["profile_ref"] or not summary or raw.get("summary") != summary):
+                status, reason = "failed", "review_evidence_identity_mismatch"
+        self._emit("review_evidence_recorded", {
+            **common, "proposal_id": proposal_id, "status": status, "reason": reason,
+            "summary": summary if status == "ok" else None,
+            "evidence": {"rope_layout": ref} if valid_ref else {},
+        })
+        if status == "ok":
+            self.router.reopen_for_review(self.phase, proposal_id, ref, summary)
+
+    def _unresolved_reviews(self) -> list[str]:
+        if self.goals is None:
+            return []
+        handled = set(self._control.get("review_feedback_handled", []))
+        revision = self.state["current_revision"]["id"]
+        return [row["proposal_id"] for row in self.router.review_feedback
+                if row["action"] == "integrate_patch" and row.get("parent") == revision
+                and row["proposal_id"] not in handled]
+
+    def _review_feedback(self) -> list[dict]:
+        collection_results = {
+            task["params"]["proposal_id"]: task["result"]
+            for task in self.dispatcher.tasks.values()
+            if task["action"] == ROPE_ACTION and task.get("result")
+        }
+        feedback = self.router.review_feedback
+        for row in feedback:
+            if result := collection_results.get(row["proposal_id"]):
+                row.update(evidence_status=result["status"], evidence_reason=result["reason"])
+        return feedback
 
     def _kernel(self) -> None:
         route = self.settings["kernel_backend"]
@@ -647,10 +847,87 @@ class Coordinator:
             for row in self.state["stack_validations"]
         )
 
+    def _new_direction(self) -> dict | None:
+        if self.goals is None:
+            return None
+        supported = self.state["runtime"]["capabilities"]
+        allowed = []
+        if self.task.get("allowed_parameters"):
+            allowed.append("parameters")
+        if self.store.manifest["mode"] == "simulated" or self.scenario.get("agent_source_excerpts"):
+            allowed.append("patch")
+        if self.settings["profile_enabled"] and "profile" in supported:
+            allowed.append("profile")
+        if self.settings["kernel_backend"] != "disabled":
+            allowed.append("kernel")
+        pivot = direction_change(self.state, allowed)
+        if pivot is not None and all(prior["tested_candidates"] != pivot["tested_candidates"]
+                                    for prior in self.state["direction_changes"]):
+            return pivot
+        return None
+
+    def _current_goal(self) -> dict | None:
+        current = (self.state["current_revision"] or {}).get("id")
+        for goal in reversed(self.state["goal_assessments"]):
+            if goal.get("revision") == current:
+                if not self.store.verify_evidence(goal["evidence"]["goal_assessment"]):
+                    return None
+                if goal["status"] == "pass" and any(
+                    not self.store.verify_evidence(reference)
+                    for arm in goal["arms"].values() for reference in arm["evidence"].values()
+                ):
+                    return None
+                return goal
+        return None
+
+    def _record_goal(self, assessment: dict, attempt: str, common: dict | None = None) -> None:
+        evidence = self.store.put_evidence(
+            f"evidence/goals/{attempt}.json", assessment, producer="independent_goal_retest",
+        )
+        self._emit("goal_assessed", {
+            **assessment, **(common or {"cycle": self.cycle, "phase": self.phase}),
+            "evidence": {"goal_assessment": evidence},
+        })
+        if assessment["reason"] == "goal_candidate_correctness_failed":
+            self._rollback_invalid_stack(assessment["revision"], evidence)
+
+    def _rollback_invalid_stack(self, revision: str, evidence: dict) -> None:
+        accepted = next((row for row in self.state["decisions"]
+                         if row["candidate_id"] == revision and row["version_action"] == "KEEP"), None)
+        previous = (accepted or {}).get("parent_revision") or {}
+        if not self.store.verify_evidence(previous.get("validation_ref") or {}):
+            baseline = self.state["baseline"]
+            previous = {**baseline["revision"], "summary": baseline["measurement"]["summary"],
+                        "validation_ref": baseline["evidence"]["revision_measurement"]}
+        self._emit("accepted_stack_rolled_back", {
+            "rejected_revision": revision, "revision": previous,
+            "reason": "goal_candidate_correctness_failed", "evidence": evidence,
+        })
+
+    def _changed_from_baseline(self) -> bool:
+        baseline = self.state["baseline"]
+        current = self.state["current_revision"]
+        return bool(baseline and current and baseline["revision"]["id"] != current["id"])
+
+    def _schedule_goal_retest(self) -> None:
+        self._register("stack_revalidate", key="goal", reason="goal_revalidate", estimated_seconds=GOAL_RETEST_COST)
+
     def _sweep(self) -> None:
         completed = self.state["sweeps"]
         if completed and completed[-1]["cycle"] == self.cycle:
-            next_phase, reason = after_sweep(self.state, self.settings, self.budget)
+            goal = self._current_goal() if self.goals else None
+            if (self.goals and not goal and self._changed_from_baseline()
+                    and self.budget >= GOAL_RETEST_COST and not self._phase_tasks("stack_revalidate")
+                    and warrants_retest(self.state, self.goals, self.task["rules"])):
+                self._schedule_goal_retest()
+                return
+            pivot = self._new_direction()
+            next_phase, reason = after_sweep(
+                self.state, self.settings, self.budget, goal_driven=self.goals is not None,
+                goal_passed=bool(goal and goal["status"] == "pass"), new_direction=pivot is not None,
+            )
+            if pivot and next_phase == "FRAMEWORK_AGENT":
+                self._emit("direction_changed", pivot)
             self._change_phase(next_phase, reason, next_cycle=next_phase == "FRAMEWORK_AGENT")
             return
         revision = self.state["current_revision"]["id"]
@@ -658,7 +935,10 @@ class Coordinator:
             self._register("stack_revalidate", reason="before_sweep")
             return
         previous = next((row["revision"] for row in reversed(completed) if row["status"] == "ok"), None)
-        skip = sweep_skip_reason(self.settings, revision, previous, self.budget)
+        available = self.budget
+        if self.goals and self._changed_from_baseline() and self._current_goal() is None:
+            available = max(0, available - GOAL_RETEST_COST)
+        skip = sweep_skip_reason(self.settings, revision, previous, available)
         if self._stack_needs_measurement():
             skip = "stack_unverified"
         if skip:
@@ -666,13 +946,27 @@ class Coordinator:
                 "status": "skipped", "reason": skip, "revision": revision, "cycle": self.cycle, "pairs": [],
             })
         else:
-            levels = self.settings["sweep_concurrency"][: int(self.budget // SWEEP_PAIR_COST)]
+            levels = self.settings["sweep_concurrency"][: int(available // SWEEP_PAIR_COST)]
             self._register(
                 "conc_sweep", revision=revision, concurrency_levels=levels,
                 estimated_seconds=len(levels) * SWEEP_PAIR_COST,
             )
 
     def _close(self) -> None:
+        if self.goals and self._current_goal() is None:
+            if (self._changed_from_baseline() and self.budget >= GOAL_RETEST_COST
+                    and not self._phase_tasks("stack_revalidate")):
+                self._schedule_goal_retest()
+                return
+            current = (self.state["current_revision"] or {}).get("id")
+            original = ((self.state["baseline"] or {}).get("revision") or {}).get("id")
+            status, reason = "incomplete", "goal_retest_unavailable"
+            if not original:
+                reason = "goal_original_unavailable"
+            elif original == current:
+                status, reason = "fail", "goal_no_accepted_candidate"
+            self._record_goal({"status": status, "reason": reason, "goals": self.goals,
+                               "revision": current, "baseline_revision": original, "checks": {}}, "close")
         if self._stack_needs_measurement() and self.budget >= 1 and not self._phase_tasks("stack_revalidate"):
             self._register("stack_revalidate", reason="close_stack_unverified")
             return

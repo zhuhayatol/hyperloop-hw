@@ -13,7 +13,7 @@ from .actions.knowledge import load_verified_recipe
 from .agents import provider_config
 from .artifacts import publish_indexes
 from .backends import BackendError
-from .contracts import ContractError, digest, read_json, safe_id, validate_reference, validate_target, validate_task
+from .contracts import ContractError, digest, json_bytes, read_json, safe_id, validate_reference, validate_target, validate_task
 from .report import write_report
 from .session import SessionBusy, SessionStore, atomic_write, project
 
@@ -40,7 +40,7 @@ def _status(store: SessionStore, state: dict[str, Any]) -> dict[str, Any]:
         }
         for decision in state.get("decisions", [])
     ]
-    return {
+    result = {
         "session": str(store.path),
         "mode": store.manifest["mode"],
         "phase": state["phase"],
@@ -52,9 +52,14 @@ def _status(store: SessionStore, state: dict[str, Any]) -> dict[str, Any]:
         "task_counts": dict(task_counts),
         "decisions": decisions,
     }
+    if store.manifest.get("task", {}).get("goals"):
+        goals = state.get("goal_assessments", [])
+        result["goal_assessment"] = next((goal for goal in reversed(goals) if goal.get("revision") == current.get("id")), None)
+        result["blocker"] = state.get("blocker")
+    return result
 
 
-def _run(args: argparse.Namespace) -> dict[str, Any]:
+def _run(args: argparse.Namespace, *, observer=None) -> dict[str, Any]:
     from .coordinator import Coordinator
 
     task = read_json(args.task)
@@ -64,7 +69,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("task.settings must be an object")
         settings["kernel_backend"] = args.kernel_backend
     target = read_json(args.target)
-    reference = read_json(args.reference)
+    reference = read_json(args.reference) if args.reference is not None else None
+    baseline_history = getattr(args, "baseline_history", None)
     scenario = read_json(args.scenario)
     if any(key in scenario for key in ("agent_provider", "agent_source_excerpts")):
         raise ContractError("Agent provider and source excerpts must be selected with run options")
@@ -97,8 +103,43 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         target,
         reference,
         scenario,
+        baseline_history=baseline_history,
     )
-    return _status(coordinator.store, coordinator.run(max_steps=args.max_steps))
+    if baseline_history is not None:
+        manifest = coordinator.store.manifest
+        atomic_write(args.session_root / "reference" / "reference.json", json_bytes(manifest["reference"]))
+        atomic_write(args.session_root / "reference" / "reuse.json", json_bytes(manifest["baseline_reuse"]))
+    return _run_coordinator(coordinator, args.max_steps, observer)
+
+
+def _run_coordinator(coordinator, max_steps: int | None, observer=None) -> dict[str, Any]:
+    if observer is None:
+        return _status(coordinator.store, coordinator.run(max_steps=max_steps))
+
+    coordinator.observer = observer
+    try:
+        with observer.activate():
+            state = coordinator.run(max_steps=max_steps)
+    except (ValueError, OSError, BackendError, KeyboardInterrupt) as error:
+        status = "paused" if isinstance(error, KeyboardInterrupt) else "failed"
+        observer.progress("会话", str(error) or "运行中断，已保存最近一次完成的交接", status=status)
+        observer.checkpoint(coordinator.store, coordinator.store.state(), status=status)
+        try:
+            with coordinator.store.execution_lease():
+                coordinator.report()
+        except (ValueError, OSError, SessionBusy) as report_error:
+            observer.progress("报告", f"暂未更新报告，已保留原始事件（{report_error}）", status=status)
+        raise
+
+    status = "done" if state["phase"] == "DONE" else "paused" if max_steps and not state.get("blocker") else "blocked"
+    observer.checkpoint(coordinator.store, state, status=status)
+    return _status(coordinator.store, state)
+
+
+def _start(args: argparse.Namespace) -> dict[str, Any]:
+    from .start import start
+
+    return start(args, capture_reference=_capture_reference, run_session=_run)
 
 
 def _reference_identity(task: dict, target: dict, reference: dict) -> dict[str, str]:
@@ -151,7 +192,22 @@ def _resume(args: argparse.Namespace) -> dict[str, Any]:
     from .coordinator import Coordinator
 
     coordinator = Coordinator.open(args.session)
-    return _status(coordinator.store, coordinator.run(max_steps=args.max_steps))
+    scenario = coordinator.store.manifest.get("scenario", {})
+    startup = scenario.get("startup", {})
+    if not isinstance(startup, dict) or startup.get("schema_version") != 1:
+        return _run_coordinator(coordinator, args.max_steps)
+
+    from .observability import RunObserver
+    from .start import _provider_key, launch_lease, record_start_result
+
+    root = coordinator.store.path.parents[1]
+    observer = RunObserver(root, latest_path=root.parent / "最新说明.md")
+    provider = scenario.get("agent_provider", {}).get("provider", "replay")
+    key_path = startup.get("agent_key_file")
+    with launch_lease(root.parent, coordinator.store.manifest["target"]), _provider_key(provider, Path(key_path) if key_path else None):
+        result = _run_coordinator(coordinator, args.max_steps, observer)
+    record_start_result(root, result, paused=args.max_steps is not None)
+    return result
 
 
 def _read_status(args: argparse.Namespace) -> dict[str, Any]:
@@ -199,6 +255,11 @@ def _reproduce(args: argparse.Namespace) -> dict[str, Any]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hyperloop", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    start = commands.add_parser("start", help="start from a Markdown task and YAML configuration")
+    start.add_argument("--task", type=Path, required=True)
+    start.add_argument("--config", type=Path, required=True)
+    start.set_defaults(handler=_start)
+
     run = commands.add_parser("run", help="freeze JSON inputs and start a Session")
     for name in ("task", "target", "reference", "scenario"):
         run.add_argument(f"--{name}", type=Path, required=True)
@@ -244,6 +305,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         result = args.handler(args)
+    except KeyboardInterrupt:
+        print("hyperloop: interrupted", file=sys.stderr)
+        return 130
     except (ValueError, OSError, SessionBusy, BackendError) as error:
         print(f"hyperloop: {error}", file=sys.stderr)
         return 1

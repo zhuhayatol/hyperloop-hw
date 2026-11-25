@@ -13,7 +13,9 @@ from typing import Any
 from urllib.parse import quote
 
 from .contracts import json_bytes
+from .observability import REVIEW_EVIDENCE_EVENTS, describe_event, status_label
 from .session import atomic_write
+from .signal_flow import SIGNAL_FLOW_STYLES, build_signal_flow, signal_flow_html
 from .validation_graph import build_reproduction_graphs, build_validation_graphs, native_geak_trials, read_native_delivery
 
 
@@ -326,7 +328,8 @@ def _profile_title(profile: Mapping[str, Any]) -> str:
 
 def _timeline_entry(event: Mapping[str, Any]) -> Mapping[str, Any]:
     if event.get("type") != "control_checkpoint":
-        return event
+        message = describe_event(event)
+        return {**event, "operator_message": message} if message else event
     payload = _mapping(event.get("payload"))
     router = _mapping(payload.get("router"))
     inbox = _mapping(payload.get("inbox", router.get("inboxes")))
@@ -353,8 +356,10 @@ def _event_title(event: Mapping[str, Any]) -> str:
     pieces = (
         _label(event.get("seq"), ""),
         _label(event.get("at"), ""),
-        _label(event.get("type"), ""),
-        checkpoint or _label(_pick(payload, "role", "agent", "phase", "task_id", "candidate_id"), ""),
+        event.get("operator_message") or _label(event.get("type"), ""),
+        "" if event.get("operator_message") else (
+            checkpoint or _label(_pick(payload, "role", "agent", "phase", "task_id", "candidate_id"), "")
+        ),
     )
     return " · ".join(piece for piece in pieces if piece) or "事件"
 
@@ -392,7 +397,7 @@ def _heading_data(summary: Mapping[str, Any]) -> list[tuple[str, Any]]:
     task = _mapping(scope.get("task"))
     model = _mapping(task.get("model"))
     workload = _mapping(task.get("workload"))
-    return [
+    heading = [
         ("停止原因", summary.get("stop_reason")),
         ("当前阶段", summary.get("phase")),
         ("宏循环", summary.get("cycle")),
@@ -404,6 +409,12 @@ def _heading_data(summary: Mapping[str, Any]) -> list[tuple[str, Any]]:
         ("工作负载", _pick(workload, "id", "name") or task.get("workload")),
         ("事件水位", summary.get("state_event_seq")),
     ]
+    if task.get("goals"):
+        goal = _mapping(summary.get("goal_assessment"))
+        heading.insert(5, ("最终目标验收", status_label(goal.get("status", "incomplete"))))
+    if blocker := _mapping(summary.get("blocker")):
+        heading.insert(1, ("会话阻断", blocker.get("reason")))
+    return heading
 
 
 _DECISION_COLUMNS = ("候选", "证据充分度", "指标验收", "版本动作", "相对父版", "相对原始基线")
@@ -560,7 +571,8 @@ def _agent_call_rows(raw_events: list[Mapping[str, Any]], state: Mapping[str, An
         preview = _pretty(intents) if "normalized_intents" in proof else None
         if preview and len(preview) > 1200:
             preview = preview[:1200] + "\n…"
-        result.append({**data, "event_seq": event["seq"], "preview": preview, "outcomes": decisions})
+        result.append({**data, "event_seq": event["seq"], "at": event.get("at"),
+                       "preview": preview, "outcomes": decisions})
     return result
 
 
@@ -586,14 +598,97 @@ def _agent_call_section(summary: dict[str, Any]) -> str:
     return "".join(result) or "<p>尚无外部 Agent 调用记录。</p>"
 
 
+def _goal_result(row: Mapping[str, Any]) -> str:
+    comparison = _mapping(row.get("comparison"))
+    change = _comparison(comparison.get("over_original", comparison))
+    return " · ".join((status_label(row.get("status")), _label(row.get("revision")), change))
+
+
+def _direction_results(state: Mapping[str, Any], events: list[Mapping[str, Any]]) -> list[tuple[str, str, str]]:
+    result = []
+    tasks = list(_mapping(state.get("tasks")).values())
+    decisions = _records(state.get("decisions"))
+    intents = [_mapping(_mapping(event.get("payload")).get("intent")) for event in events
+               if event.get("type") == "agent_intent"]
+    for label, action, kinds in (
+        ("调参", "explore", ("parameters",)),
+        ("框架补丁", "integrate_patch", ("patch",)),
+        ("算子", "kernel_agent", ("kernel", "operator_patch")),
+    ):
+        attempts = [_mapping(row) for row in tasks if _mapping(row).get("action") == action]
+        outcomes = [row for row in decisions if row.get("kind") in kinds]
+        measured = [row for row in outcomes if row.get("evidence_state") == "sufficient"
+                    and _mapping(row.get("comparison")).get("over_parent")]
+        if measured:
+            status = f"已有 {len(measured)} 个候选的配对测量"
+            detail = "、".join(f"{_label(row.get('candidate_id'))} {_label(row.get('version_action'))}" for row in outcomes)
+        elif outcomes:
+            status = "已有裁决，缺少完整配对计时"
+            detail = "、".join(f"{_label(row.get('candidate_id'))} {_label(row.get('reason'))}" for row in outcomes)
+        elif attempts:
+            last = attempts[-1]
+            response = _mapping(last.get("result"))
+            status = f"任务{status_label(last.get('status'))}，暂无配对测量"
+            detail = _label(response.get("reason") or last.get("task_id"))
+        elif action == "kernel_agent" and (skipped := next((event for event in reversed(events)
+                if event.get("type") == "kernel_skipped"), None)):
+            status, detail = "已跳过", _label(_mapping(skipped.get("payload")).get("reason"))
+        elif any(_mapping(intent.get("payload", intent)).get("action") == action for intent in intents):
+            status, detail = "已提案，未派发", "参见 Agent 回复和路由事件"
+        else:
+            status, detail = "未派发" if action == "kernel_agent" else "本轮无提案", "暂无测量结果"
+        result.append((label, status, detail))
+    return result
+
+
+def _startup_links(root: Path, manifest: Mapping[str, Any]) -> list[tuple[str, str]]:
+    startup = _mapping(_mapping(manifest.get("scenario")).get("startup"))
+    if startup.get("schema_version") != 1 or len(root.parents) < 2:
+        return []
+    launch = root.parents[1]
+    if launch.name != root.name:
+        return []
+    files = (
+        ("任务原文", "inputs/任务.md"), ("用户启动配置", "inputs/启动配置.yaml"),
+        ("有效任务", "inputs/task.json"), ("有效目标配置", "inputs/target.json"),
+        ("参考输出", "reference/reference.json"), ("参考采集回执", "reference/capture.json"),
+        ("历史基线来源", "reference/reuse.json"),
+        ("启动与运行日志", "console.log"), ("本轮最新说明", "最新说明.md"),
+    )
+    return [(label, quote(f"../../{relative}", safe="/")) for label, relative in files
+            if _local_file(launch, relative)[0] is not None]
+
+
+def _review_rows(timeline: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    proposals = {data["proposal_id"] for row in timeline if row["type"] in REVIEW_EVIDENCE_EVENTS
+                 if isinstance((data := _mapping(row.get("payload"))).get("proposal_id"), str)}
+    return [row for row in timeline if row["type"] in REVIEW_EVIDENCE_EVENTS or (
+        row["type"] == "review_verdict" and _label(_mapping(row.get("payload")).get("proposal_id"), "") in proposals
+    )]
+
+
+def _review_section(rows: list[Mapping[str, Any]], evidence: list[dict[str, Any]]) -> str:
+    if not rows:
+        return ""
+    items = []
+    for row in rows:
+        links = [entry for entry in _evidence_for(row, evidence) if entry["link_state"] == "available"]
+        items.append(f'<li><a href="#event-{row["seq"]}">#{row["seq"]}</a> · {_h(row.get("operator_message"))}'
+                     f'{_evidence_list(links) if links else ""}</li>')
+    return f'<section id="review-evidence"><h2>补证与复审</h2><ol>{"".join(items)}</ol></section>'
+
+
 def _report_html(summary: dict[str, Any]) -> str:
     heading = _heading_data(summary)
     mode = _h(summary["mode"])
     labels = "".join(f"<dt>{escape(name)}</dt><dd>{_h(value)}</dd>" for name, value in heading)
+    review = _review_rows(summary["timeline"])
     sections = {
+        **({"signal-flow": "全局信号流"} if summary["signal_flow"] else {}),
         "overview": "运行范围",
         "validation": "验证交接图",
         "agents": "Agent 回复",
+        **({"review-evidence": "补证与复审"} if review else {}),
         "decisions": "候选验收",
         "profiles": "采集与扫描",
         "timeline": "执行时间线",
@@ -622,25 +717,36 @@ def _report_html(summary: dict[str, Any]) -> str:
     baseline = _details(
         "原始基线的测量与证据", summary["baseline"], _evidence_for(summary["baseline"], evidence)
     )
+    goals = "".join(_details(
+        f"独立目标验收 · {_goal_result(row)}", row, _evidence_for(row, evidence)
+    ) for row in summary["goal_assessments"])
+    direction_results = (_html_table(("方向", "本轮证据", "说明"), summary["direction_results"])
+                         if summary["direction_results"] else "")
+    console = '<a href="console.log">终端日志</a>' if summary["has_console_log"] else ""
+    startup = "".join(f'<li><a href="{_h(path)}">{_h(label)}</a></li>' for label, path in summary["startup_links"])
     warnings = "".join(f"<li>{escape(item)}</li>" for item in summary["report_warnings"])
+    styles = _STYLES + (SIGNAL_FLOW_STYLES if summary["signal_flow"] else "")
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Hyperloop Session · {_h(summary["session_id"])}</title><style>{_STYLES}</style></head>
+<title>Hyperloop Session · {_h(summary["session_id"])}</title><style>{styles}</style></head>
 <body><header><h1>Hyperloop Session · {_h(summary["session_id"])}</h1>
 <p><strong class="mode">{mode}</strong></p><nav aria-label="报告目录">{navigation}
-<a href="report.md">Markdown</a><a href="summary.json">JSON</a></nav></header>
+<a href="report.md">Markdown</a><a href="summary.json">JSON</a>{console}</nav></header>
 <main>
+{signal_flow_html(summary["signal_flow"], summary["mode"])}
 <section id="overview"><h2>运行范围</h2><dl>{labels}</dl>{baseline}
+{f'<ul>{startup}</ul>' if startup else ''}
 {_details("任务及评测规则", summary["scope"])}
 {_details("贡献来源", summary["contributions"])}</section>
 <section id="validation"><h2>验证交接图</h2>
 <p>箭头上是发送的内容，接收侧写明执行操作。每条边标出会话事件、执行记录或证据还原。</p>
 {_validation_section(summary)}</section>
 <section id="agents"><h2>Agent 回复</h2>{_agent_call_section(summary)}</section>
+{_review_section(review, evidence)}
 <section id="decisions"><h2>候选验收</h2>
 {_html_table(_DECISION_COLUMNS, rows) if rows else '<p>尚无候选裁决</p>'}
-{decisions}</section>
+{decisions}{direction_results}{goals}</section>
 <section id="profiles"><h2>采集与扫描</h2>{profiles or "<p>尚无 Profile 记录</p>"}
 {sweeps or "<p>尚无 SWEEP 记录</p>"}{stack}</section>
 <section id="timeline"><h2>执行时间线</h2>{events or "<p>尚无事件</p>"}</section>
@@ -672,19 +778,25 @@ def _report_markdown(summary: dict[str, Any]) -> str:
         "",
         f"**运行模式 · {_md(summary['mode'])}**",
         "",
-        "[离线 HTML](report.html) · [结构化摘要](summary.json)",
+        "[离线 HTML](report.html) · [结构化摘要](summary.json) · [会话事件](events.jsonl)"
+        + (" · [按事件播放全局信号流](report.html#signal-flow)" if summary["signal_flow"] else "")
+        + (" · [终端日志](console.log)" if summary["has_console_log"] else ""),
         "",
         "## 运行范围",
         "",
     ]
     lines.extend(f"- {name} · {_md(value)}" for name, value in _heading_data(summary))
+    if summary["startup_links"]:
+        lines.extend(["", "### 本轮输入与参考采集", ""])
+        lines.extend(f"- [{_md(label)}]({path})" for label, path in summary["startup_links"])
     lines.extend(_md_details("原始基线的测量与证据", summary["baseline"]))
     lines.extend(_md_details("任务及评测规则", summary["scope"]))
     lines.extend(_md_details("贡献来源", summary["contributions"]))
     lines.extend(["## 验证交接图", "", "[在 HTML 中逐次查看发送方、接收方和证据](report.html#validation)", ""])
     lines.extend(["## Agent 回复", ""])
     for row in summary["agent_calls"]:
-        lines.append(f"- {_md(_agent_call_title(row))} · 回复 ID {_md(row.get('response_id'))}")
+        lines.append(f"- [{_md(row.get('at'))} · #{row['event_seq']}](report.html#event-{row['event_seq']})"
+                     f" · {_md(_agent_call_title(row))} · 回复 ID {_md(row.get('response_id'))}")
         for evidence in _evidence_for(row, summary["evidence"]):
             if evidence["href"] is not None:
                 lines.append(f"  - [角色输入与结构化回复]({evidence['href']})")
@@ -694,6 +806,15 @@ def _report_markdown(summary: dict[str, Any]) -> str:
     if not summary["agent_calls"]:
         lines.append("尚无外部 Agent 调用记录。")
     lines.append("")
+    review = _review_rows(summary["timeline"])
+    if review:
+        lines.extend(["## 补证与复审", ""])
+        for row in review:
+            lines.append(f"- [#{row['seq']}](report.html#event-{row['seq']}) · {_md(row.get('operator_message'))}")
+            for entry in _evidence_for(row, summary["evidence"]):
+                if entry["link_state"] == "available" and entry["href"] is not None:
+                    lines.append(f"  - [证据 · {_md(entry['path'])}]({entry['href']})")
+        lines.append("")
     lines.extend(["## 候选验收", ""])
     decisions = summary["decisions"]
     if decisions:
@@ -717,8 +838,22 @@ def _report_markdown(summary: dict[str, Any]) -> str:
         lines.extend(_md_details(f"整栈复测 {index}", row))
     if not (summary["profiles"] or summary["sweeps"] or summary["stack_validations"]):
         lines.append("尚无采集或扫描记录")
+    if summary["goal_assessments"]:
+        lines.extend(["", "## 独立目标验收", ""])
+        for row in summary["goal_assessments"]:
+            lines.extend(_md_details(_goal_result(row), row))
+            for item in _evidence_for(row, summary["evidence"]):
+                if item["href"] is not None:
+                    lines.append(f"- [验收证据 · {_md(item['path'])}]({item['href']})")
+    if summary["direction_results"]:
+        lines.extend(["", "## 各方向的试验结果", "", *_md_table(
+            ("方向", "本轮证据", "说明"), summary["direction_results"]
+        )])
     lines.extend(["", "## 执行时间线", ""])
-    lines.extend(f"- {_md(_event_title(row))}" for row in summary["timeline"])
+    lines.extend(
+        f"- [#{row['seq']}](report.html#event-{row['seq']}) · {_md(row.get('at'))} · {_md(row['operator_message'])}"
+        for row in summary["timeline"] if row.get("operator_message")
+    )
     lines.extend(["", "## 原始证据", "", "裁决取自已提交事件，文件状态反映本次读取。", ""])
     lines.extend(f"- {_md(warning)}" for warning in summary["report_warnings"])
     for entry in summary["evidence"]:
@@ -751,6 +886,16 @@ def write_report(
     def read_graph_evidence(ref: Mapping[str, Any]) -> dict[str, Any] | None:
         return _read_graph_evidence(root, entries, ref)
 
+    def signal_evidence_href(ref: Mapping[str, Any]) -> str | None:
+        entry = entries.get(_reference_key(ref), {})
+        return entry.get("href") if entry.get("link_state") == "available" else None
+
+    validation_graphs = build_validation_graphs(state, raw_events, read_graph_evidence)
+    validation_graphs += build_reproduction_graphs(reproductions, read_graph_evidence)
+    task_links = {graph["task_id"]: f"#validation-task-{index}" for index, graph in enumerate(validation_graphs, 1)}
+    assessments = _records(state.get("goal_assessments"))
+    current = _identity(state.get("current_revision"))
+    current_goal = next((row for row in reversed(assessments) if row.get("revision") == current), None)
     summary = {
         "schema_version": 1,
         "session_id": manifest.get("session_id", root.name),
@@ -766,12 +911,18 @@ def write_report(
         "profiles": _records(state.get("profiles")),
         "sweeps": _records(state.get("sweeps")),
         "stack_validations": _records(state.get("stack_validations")),
+        "goal_assessments": assessments,
+        "goal_assessment": current_goal,
+        "direction_results": _direction_results(state, raw_events) if _mapping(scope.get("task")).get("goals") else [],
+        "has_console_log": _local_file(root, "console.log")[0] is not None,
+        "startup_links": _startup_links(root, manifest),
         "timeline": timeline,
         "evidence": list(entries.values()),
         "agent_calls": _agent_call_rows(raw_events, state, read_graph_evidence),
-        "validation_graphs": build_validation_graphs(state, raw_events, read_graph_evidence)
-        + build_reproduction_graphs(reproductions, read_graph_evidence),
+        "signal_flow": build_signal_flow(raw_events, read_graph_evidence, signal_evidence_href, task_links),
+        "validation_graphs": validation_graphs,
         "stop_reason": state.get("stop_reason"),
+        "blocker": state.get("blocker"),
         "report_warnings": warnings,
     }
     atomic_write(root / "report.md", _report_markdown(summary).encode("utf-8"))

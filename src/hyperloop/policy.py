@@ -24,7 +24,9 @@ PHASE_ACTIONS = {
             "targeted_build",
         }
     ),
-    "FRAMEWORK_AGENT": frozenset({"explore", "specialist", "integrate_patch", "profile", "roofline", "stack_revalidate"}),
+    "FRAMEWORK_AGENT": frozenset({
+        "explore", "specialist", "integrate_patch", "profile", "roofline", "stack_revalidate", "rope_layout_probe",
+    }),
     "KERNEL_AGENT": frozenset({"kernel_agent", "integrate", "profile", "roofline", "stack_revalidate"}),
     "SWEEP": frozenset({"conc_sweep", "stack_revalidate", "integrate"}),
     "CLOSE": frozenset({"report", "session_breakdown", "stack_revalidate", "profile", "roofline", "finalize_recipe"}),
@@ -42,6 +44,7 @@ INTERNAL_ACTIONS = frozenset(
         "report",
         "session_breakdown",
         "finalize_recipe",
+        "rope_layout_probe",
     }
 )
 ENABLEMENT_INTERNAL = frozenset({"specialist", "integrate_patch"})

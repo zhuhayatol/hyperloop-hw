@@ -129,6 +129,16 @@ def validate_task(task: dict[str, Any]) -> dict[str, Any]:
         _number(rules["noise_floor_pct"], "rules.noise_floor_pct")
     if rules.get("time_boundary") != "service_end_to_end":
         raise ContractError("service performance rules must use the service_end_to_end boundary")
+    if "goals" in task:
+        goals = _mapping(task["goals"], "goals")
+        if goals.keys() != {"throughput_gain_pct", "ttft_reduction_pct"}:
+            raise ContractError("goals requires throughput_gain_pct and ttft_reduction_pct")
+        gain = _number(goals["throughput_gain_pct"], "goals.throughput_gain_pct")
+        reduction = _number(goals["ttft_reduction_pct"], "goals.ttft_reduction_pct")
+        if gain <= 0 or not 0 < reduction < 100:
+            raise ContractError("goals must require a positive throughput gain and a TTFT reduction below 100%")
+        if rules["tolerance"] != 0:
+            raise ContractError("goal-driven runs require exact reference outputs (rules.tolerance = 0)")
 
     settings = _mapping(task.get("settings"), "settings")
     if settings.get("kernel_backend") not in ("geak", "forge", "disabled"):

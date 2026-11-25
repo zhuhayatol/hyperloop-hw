@@ -1,0 +1,60 @@
+{
+  "id": "910b3-tp1",
+  "mode": "real",
+  "provider": "sglang",
+  "devices": [
+    "0"
+  ],
+  "tp_size": 1,
+  "device_name": "910B3",
+  "software": {
+    "sglang": "0.5.16",
+    "sglang_commit": "fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1",
+    "cann": "9.0.0",
+    "torch": "2.10.0+cpu",
+    "torch_npu": "2.10.0",
+    "python": "3.11.4"
+  },
+  "model_sha256": {
+    "config.json": "18e18afcaccafade98daf13a54092927904649e1dd4eba8299ab717d5d94ff45",
+    "model.safetensors": "fdf756fa7fcbe7404d5c60e26bff1a0c8b8aa1f72ced49e7dd0210fe288fb7fe"
+  },
+  "tokenizer_sha256": {
+    "tokenizer.json": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539"
+  },
+  "sglang": {
+    "python": "/opt/hyperloop-910b3-trial/stack/venv/bin/python",
+    "source_path": "/opt/hyperloop-910b3-trial/stack/sglang",
+    "model_path": "/opt/hyperloop-910b3-trial/stack/models/Qwen2.5-0.5B-Instruct",
+    "server_args": [
+      "--context-length",
+      "8192",
+      "--mem-fraction-static",
+      "0.75",
+      "--cuda-graph-max-bs-decode",
+      "32",
+      "--chunked-prefill-size",
+      "512",
+      "--disable-cuda-graph",
+      "--skip-server-warmup"
+    ],
+    "startup_timeout": 240,
+    "request_timeout": 120,
+    "ascend_use_fia": false,
+    "profile": {
+      "enabled": true,
+      "export_timeout": 180,
+      "offline_export": true,
+      "steps": 6
+    },
+    "native_forge": true,
+    "allowed_source_paths": [
+      "python/sglang/srt/layers/activation.py",
+      "python/sglang/srt/models/qwen2.py"
+    ],
+    "source_trial_user": {
+      "uid": 65534,
+      "gid": 1000
+    }
+  }
+}

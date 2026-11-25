@@ -175,17 +175,18 @@ def _check_worker(output: Path, *, worker_digest: str, model_digest: str, width:
 
 def _run_worker(
     command: list[str], environment: Mapping[str, str], runtime: Path, workspace: Path, uid: int, timeout: int,
+    *, log_name: str = "forge-worker.log", lease_kind: str = "forge_operator",
 ) -> Record:
     from ..backends.sglang import _LEASE_ENV, _lease_processes, _live_group, _process, _signal_owned, _write_lease
 
     started = time.monotonic()
     nonce = uuid4().hex
-    lease = {"nonce": nonce, "state": "launching", "kind": "forge_operator", "run_uid": uid, "pid": None}
+    lease = {"nonce": nonce, "state": "launching", "kind": lease_kind, "run_uid": uid, "pid": None}
     _write_lease(workspace, lease)
     process = None
     timed_out = False
     try:
-        with (workspace / "forge-worker.log").open("xb") as stream:
+        with (workspace / log_name).open("xb") as stream:
             process = subprocess.Popen(command, cwd=runtime, env={**environment, _LEASE_ENV: nonce},
                                        start_new_session=True, stdin=subprocess.DEVNULL, stdout=stream,
                                        stderr=subprocess.STDOUT, umask=0o027)

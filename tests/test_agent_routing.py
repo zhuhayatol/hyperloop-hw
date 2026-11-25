@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from hyperloop.agents import ReplayAgentBackend
+from hyperloop.agents.structured import project_context
 from hyperloop.dispatcher import Dispatcher
 from hyperloop.policy import PolicyGate
 from hyperloop.router import IntentRouter
@@ -85,6 +86,66 @@ class AgentRoutingTest(unittest.TestCase):
             [message["reason"] for message in self.router.inbox_for("specialist")],
             ["same as baseline", "missing evidence", "watch decoder regression"],
         )
+
+    def test_verified_supplement_reopens_the_same_proposal_at_most_once(self) -> None:
+        proposal = self._propose(
+            "rope-patch", parent="base", candidate={"id": "R02", "patch_path": "sglang/rope.py",
+                                                  "reason": "Use dense Q/K inputs."},
+        )
+        concern = "Measure strided RoPE / copy cost before proceeding."
+        self._review("rope-patch", "needs_review", reason=concern)
+        self.assertEqual(self.router.pending_proposals, {})
+        self.assertIn("rope-patch", self.router.review_evidence_candidates)
+        orchestration = project_context("orchestration", {"review_feedback": self.router.review_feedback}, {}, {}, [])
+        self.assertEqual(orchestration["review_feedback"], [{
+            "proposal_id": "rope-patch", "source": "specialist", "action": "integrate_patch",
+            "status": "needs_review", "reason": concern, "parent": "base", "candidate_ids": ["R02"],
+        }])
+        receipt = {"id": "paired-rope-01", "path": "evidence/local/path.json", "sha256": "signed"}
+        case = {
+            "phase": "prefill", "tokens": 1024, "layout_source": "observed_stride", "sample_count": 25,
+            "split_rope_us": 18, "contiguous_rope_us": 13, "copy_us": 6,
+            "copy_plus_rope_us": 19, "rope_gain_us": 5, "net_gain_us": -1,
+            "net_p25_us": -2, "net_p75_us": 0.5, "outputs_match": True,
+            "q_stride": [256, 1], "k_stride": [256, 1],
+        }
+        summary = {"kind": "rope_layout", "mode": "real", "boundary": "qwen2_ascend_rope_layout_probe",
+                   "cases": [{**case, "private_path": "/private/probe/args.json"}]}
+        self.assertFalse(self.router.reopen_for_review("KERNEL_AGENT", "rope-patch", receipt, summary))
+        self.assertTrue(self.router.reopen_for_review(FRAMEWORK, "rope-patch", receipt, summary))
+        self.assertEqual(self.dispatcher.tasks, {})
+        self.assertFalse(self.router.review_evidence_candidates)
+        self.assertEqual(self.router.proposal("rope-patch")["params"], proposal["params"])
+        reopened, = [payload for name, payload in self.events if name == "proposal_reopened"]
+        self.assertEqual((reopened["proposal_id"], reopened["evidence_ref"]), ("rope-patch", receipt))
+
+        saved = json.loads(json.dumps(self.router.snapshot()))
+        restored = IntentRouter(self.policy, self.dispatcher, self._record)
+        restored.restore(saved)
+        critic = project_context("critic", {"pending_proposals": restored.pending_proposals}, {}, {}, [])
+        pending, = critic["pending_proposals"]
+        self.assertEqual(pending["candidates"][0]["reason"], "Use dense Q/K inputs.")
+        self.assertEqual(pending["review_evidence"], {
+            "evidence_id": "paired-rope-01", "summary": {**summary, "cases": [case]},
+            "prior_review": {"reviewer": "critic", "verdict": "needs_review", "reason": concern},
+        })
+
+        self._review("rope-patch", "needs_review", reason="The net paired result straddles zero.")
+        self.assertFalse(self.router.reopen_for_review(FRAMEWORK, "rope-patch", receipt, summary))
+        self.assertEqual(self.dispatcher.tasks, {})
+        feedback = self.router.review_feedback
+        feedback[0].update(evidence_status="ok", evidence_reason="rope_layout_evidence_ready")
+        orchestration = project_context("orchestration", {"review_feedback": feedback}, {}, {}, [])
+        row, = orchestration["review_feedback"]
+        self.assertEqual(row["reason"], "The net paired result straddles zero.")
+        self.assertEqual(row["review_evidence"], pending["review_evidence"])
+        self.assertEqual((row["evidence_status"], row["evidence_reason"]), ("ok", "rope_layout_evidence_ready"))
+        review = restored.route("critic", FRAMEWORK, {
+            "kind": "review_verdict", "proposal_id": "rope-patch", "verdict": "approve",
+            "reason": "A bounded service check can assess the mixed evidence.",
+        })
+        queued = self.dispatcher.get(review["task_id"])
+        self.assertEqual((queued["proposal_id"], queued["params"]), ("rope-patch", proposal["params"]))
 
     def test_policy_denies_internal_action_wrong_phase_and_unreviewed_landing(self) -> None:
         attempts = [

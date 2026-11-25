@@ -92,6 +92,9 @@ def _initial_state() -> dict[str, Any]:
         "sweeps": [],
         "last_conc_sweep": None,
         "stack_validations": [],
+        "goal_assessments": [],
+        "direction_changes": [],
+        "blocker": None,
         "recipes": [],
         "retrieved_recipe": None,
         "round_attempts": [],
@@ -110,6 +113,7 @@ def project(events: list[dict[str, Any]]) -> dict[str, Any]:
         elif kind == "phase_changed":
             state["phase"] = data["phase"]
             state["cycle"] = data["cycle"]
+            state["blocker"] = None
         elif kind == "baseline_recorded":
             if state["baseline"] is not None:
                 raise ContractError("the original baseline is immutable")
@@ -138,6 +142,19 @@ def project(events: list[dict[str, Any]]) -> dict[str, Any]:
             state["last_conc_sweep"] = data
         elif kind == "stack_validated":
             state["stack_validations"].append(data)
+        elif kind == "goal_assessed":
+            state["goal_assessments"].append(data)
+        elif kind == "accepted_stack_rolled_back":
+            current = state["current_revision"] or {}
+            if current.get("id") != data["rejected_revision"]:
+                raise ContractError("rollback must refer to the current accepted revision")
+            state["current_revision"] = data["revision"]
+        elif kind == "direction_changed":
+            state["direction_changes"].append(data)
+        elif kind in {"run_blocked", "task_cleanup_wait"}:
+            state["blocker"] = {"event": kind, **data}
+        elif kind in {"task_started", "task_recovered", "agent_provider_started"}:
+            state["blocker"] = None
         elif kind == "recipe_recorded":
             state["recipes"].append(data)
         elif kind == "recipe_retrieved":

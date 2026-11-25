@@ -1,0 +1,16 @@
+target: 910b3-tp1
+target_config: target.910b3.protected.json
+agent_source_excerpts: excerpts.910b3.protected.json
+agent_provider: deepseek
+agent_key_file: /home/developer/.config/hyperloop/deepseek.key
+session_root: /opt
+baseline_mode: measure
+
+settings:
+  max_cycles: 3
+  max_turns_per_cycle: 2
+  budget: 45
+  profile_enabled: true
+  sweep_enabled: true
+  sweep_concurrency: [1, 2, 4]
+  kernel_backend: forge

@@ -29,6 +29,66 @@ class IntentRouter:
             {key: proposal for key, proposal in self._proposals.items() if proposal["status"] == "pending"}
         )
 
+    @property
+    def review_evidence_candidates(self) -> dict[str, dict[str, Any]]:
+        return deepcopy({
+            key: proposal for key, proposal in self._proposals.items()
+            if (proposal["status"] == "needs_review" and proposal["action"] == "integrate_patch"
+                and "review_evidence" not in proposal)
+        })
+
+    @property
+    def review_feedback(self) -> list[dict[str, Any]]:
+        feedback = []
+        for proposal in self._proposals.values():
+            if proposal["status"] not in {"needs_review", "reject"}:
+                continue
+            params = proposal["params"]
+            candidates = params.get("candidates")
+            if not isinstance(candidates, list):
+                candidates = [params.get("candidate")]
+            feedback.append({
+                "proposal_id": proposal["proposal_id"],
+                "source": proposal["source"],
+                "action": proposal["action"],
+                "status": proposal["status"],
+                "reason": proposal["review"]["reason"],
+                "parent": params.get("parent"),
+                "candidate_ids": [item["id"] for item in candidates
+                                  if isinstance(item, dict) and isinstance(item.get("id"), str)],
+                **({"review_evidence": deepcopy(proposal["review_evidence"])} if "review_evidence" in proposal else {}),
+            })
+        return feedback
+
+    def proposal(self, proposal_id: str) -> dict[str, Any] | None:
+        return deepcopy(self._proposals.get(proposal_id))
+
+    def reopen_for_review(
+        self, phase: str, proposal_id: str, evidence_ref: Mapping[str, str], summary: Mapping[str, Any],
+    ) -> bool:
+        """Return the original proposal to Critic once after Coordinator verifies new evidence."""
+        proposal = self._proposals.get(proposal_id)
+        if (
+            proposal is None or proposal["status"] != "needs_review" or proposal["action"] != "integrate_patch"
+            or proposal["phase"] != phase.strip().upper() or "review_evidence" in proposal
+            or not evidence_ref or not summary
+        ):
+            return False
+        review_evidence = {
+            "evidence_ref": deepcopy(dict(evidence_ref)),
+            "summary": deepcopy(dict(summary)),
+            "prior_review": deepcopy(proposal["review"]),
+        }
+        proposal.update(status="pending", review_evidence=review_evidence)
+        self._publish("critic", "proposal_reopened", {
+            "proposal_id": proposal_id,
+            "source": proposal["source"],
+            "phase": proposal["phase"],
+            "action": proposal["action"],
+            **review_evidence,
+        })
+        return True
+
     def inbox_for(self, role: str) -> list[dict[str, Any]]:
         return deepcopy(self._inboxes.get(role, []))
 

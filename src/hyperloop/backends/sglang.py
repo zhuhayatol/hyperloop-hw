@@ -34,6 +34,11 @@ _LEASE = "sglang-lease.json"
 _LEASE_ENV = "HYPERLOOP_SGLANG_LEASE"
 _LOOPBACK = build_opener(ProxyHandler({}))
 _PARAMETER_FLAG = "--chunked-prefill-size"
+_DISABLE_GRAPH = "--disable-cuda-graph"
+_DECODE_GRAPH = "--cuda-graph-backend-decode"
+_PREFILL_GRAPH = "--cuda-graph-backend-prefill"
+_GRAPH_SWITCHES = {_DISABLE_GRAPH, _DECODE_GRAPH, _PREFILL_GRAPH,
+                   "--disable-decode-cuda-graph", "--disable-prefill-cuda-graph"}
 _FORGE_SOURCE = "python/sglang/srt/layers/activation.py"
 _FORGE_MARKER = re.compile(r"HYPERLOOP_FORGE_SWIGLU_INVOKED_[0-9a-f]{12}")
 _FORGE_CALL = re.compile(
@@ -238,6 +243,36 @@ def _chunk_args(args: list[str], chunk: int | None) -> tuple[list[str], int | No
     return result, actual
 
 
+def _decode_graph_args(args: list[str], enabled: bool) -> tuple[list[str], Record]:
+    """Override decode only for the pinned graph-off target, leaving prefill off."""
+    if type(enabled) is not bool:
+        raise BackendError("decode_graph_enabled must be a boolean")
+    switches = [arg for arg in args if arg.partition("=")[0] in _GRAPH_SWITCHES]
+    if switches != [_DISABLE_GRAPH]:
+        raise BackendError("a decode graph candidate needs one graph-off target flag and no phase graph overrides")
+    if not enabled:
+        return args, {"disable_cuda_graph": True}
+    updated = [arg for arg in args if arg != _DISABLE_GRAPH]
+    updated.extend((f"{_DECODE_GRAPH}=full", f"{_PREFILL_GRAPH}=disabled"))
+    return updated, {"disable_cuda_graph": False, "cuda_graph_backend_decode": "full",
+                     "cuda_graph_backend_prefill": "disabled"}
+
+
+def _verify_decode_graph_capture(log: Path) -> None:
+    """Require capture completion from the owned, freshly started server log."""
+    began = False
+    try:
+        with log.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if "Capture target decode NPU graph begin. backend=full" in line:
+                    began = True
+                elif began and "Capture target decode NPU graph end." in line:
+                    return
+    except OSError as error:
+        raise BackendError(f"could not read decode graph capture proof: {log}") from error
+    raise BackendError(f"SGLang did not record completion of full decode NPU graph capture: {log}")
+
+
 def _provider_credential(name: str) -> bool:
     key = name.upper()
     return key.endswith(("_API_KEY", "_API_TOKEN")) or key in {"GH_TOKEN", "GITHUB_TOKEN", "HF_TOKEN"}
@@ -312,6 +347,11 @@ class SGLangBackend:
         if self._native_forge and (not self._profile_enabled or not self._trial_user
                                    or _FORGE_SOURCE not in self._allowed_source):
             raise BackendError("native Forge requires Profile and an isolated, allow-listed SwiGLU source path")
+        self._rope_layout_probe = config.get("rope_layout_probe", False)
+        if type(self._rope_layout_probe) is not bool:
+            raise BackendError("target.sglang.rope_layout_probe must be a boolean")
+        if self._rope_layout_probe and (not self._profile_enabled or self._trial_user is None):
+            raise BackendError("RoPE layout evidence requires Profile and a dedicated SGLang account")
         self._forward_repeats = forward_repeats(config.get("model_forward", {}))
         if self._forward_repeats is not None:
             if self._trial_user is None:
@@ -452,6 +492,12 @@ class SGLangBackend:
                 }
             if self._profile_steps is not None:
                 environment["profile_scheduler_steps"] = self._profile_steps
+            if self._rope_layout_probe:
+                from .sglang_rope import ROPE_MODEL_SOURCE, ROPE_SOURCE
+
+                environment["rope_layout_sources"] = {
+                    path: self._file_hash(self._source / path) for path in (ROPE_MODEL_SOURCE, ROPE_SOURCE)
+                }
             if self._forward_repeats is not None:
                 environment["model_forward_measurement"] = {
                     "symbol": FORWARD_SYMBOL, "repeats": self._forward_repeats, "graph_replay": False,
@@ -464,6 +510,8 @@ class SGLangBackend:
             capabilities.append("profile")
         if self._forward_repeats is not None:
             capabilities.append("forward")
+        if self._rope_layout_probe:
+            capabilities.append("rope_layout_probe")
         for route, enabled in (("native_geak", self._native_geak), ("native_forge", self._native_forge)):
             if enabled:
                 capabilities.append(route)
@@ -487,7 +535,7 @@ class SGLangBackend:
                     raise BackendError("SGLang source candidates require an isolated runtime")
             elif change["kind"] != "parameters":
                 raise BackendError(f"unsupported SGLang framework change: {change['kind']}")
-        if parameters.keys() - {"chunked_prefill_size", "ascend_use_fia"}:
+        if parameters.keys() - {"chunked_prefill_size", "ascend_use_fia", "decode_graph_enabled"}:
             raise BackendError("unsupported real SGLang framework parameter")
         if ("ascend_use_fia" in parameters
                 and (self._ascend_use_fia is None or type(parameters["ascend_use_fia"]) is not bool)):
@@ -496,6 +544,11 @@ class SGLangBackend:
             chunk = parameters["chunked_prefill_size"]
             if type(chunk) is not int or (chunk < 1 and chunk != -1):
                 raise BackendError("chunked_prefill_size must be positive or -1")
+        if "decode_graph_enabled" in parameters:
+            decode_graph = parameters["decode_graph_enabled"]
+            _decode_graph_args(self._server_args, decode_graph)
+            if decode_graph and stack["kernels"]:
+                raise BackendError("the native Forge invocation proof requires decode graph to stay disabled")
         if identifier in self._stacks and self._stacks[identifier] != stack:
             raise BackendError(f"revision {identifier} is already bound to a different stack")
         self._stacks[identifier] = stack
@@ -525,11 +578,66 @@ class SGLangBackend:
             environment=self._env, uid=uid, gid=gid,
         )
 
+    def run_rope_layout_probe(
+        self, *, workload: Mapping[str, Any], profile: Mapping[str, Any],
+        revision: Mapping[str, Any], attempt: str,
+    ) -> Record:
+        from .sglang_rope import ROPE_MODEL_SOURCE, observe_rope_layouts, run_rope_layout_probe
+
+        if not self._rope_layout_probe or not self._trial_user or self._session is None or self._child is not None:
+            raise BackendError("RoPE layout measurement requires an idle, bound and protected Session")
+        if _DISABLE_GRAPH not in self._server_args or revision["parameters"].get("decode_graph_enabled") is True:
+            raise BackendError("RoPE layout evidence requires the frozen graph-disabled configuration")
+        workspace = self._session / "workspaces" / f"{attempt}-rope-observer"
+        prepared = self.prepare(revision["id"], workspace, kind="rope_layout")
+        instance = None
+        observation = None
+        failure = None
+        try:
+            instance = self.launch(prepared, workload)
+            identity = self._observation(instance, workload)
+            lease = json.loads((workspace / _LEASE).read_bytes())
+            workers = set(_lease_processes(lease)) | set(_live_group(lease))
+            source = instance["source_overlay"]
+            staged = next(row["staged_path"] for row in source["files"] if row["path"] == ROPE_MODEL_SOURCE)
+            loaded = next(row for row in source["loaded_files"] if row["path"] == staged)
+            if loaded["pid"] not in workers:
+                raise BackendError("RoPE layout observer did not load in the owned SGLang service")
+            observation = observe_rope_layouts(
+                instance["base_url"], workload, control=workspace / "rope-layout.window",
+                log=Path(instance["server_log"]), workers=workers, timeout=self._request_timeout,
+            )
+            self._observation(instance, workload)
+            observation.update(identity=identity, loaded_instrumentation=loaded, server_log=instance["server_log"])
+        except (BackendError, OSError, ValueError, KeyError, TypeError, StopIteration) as error:
+            failure = str(error)
+        finally:
+            try:
+                cleanup = self.cleanup(prepared, instance)
+            except BackendError as error:
+                cleanup = {"released": False, "reason": str(error)}
+        if not cleanup["released"]:
+            return {"status": "failed", "reason": "cleanup_unconfirmed", "observer_cleanup": cleanup}
+        if observation is None or failure is not None:
+            return {"status": "failed", "reason": "rope_layout_observation_failed", "detail": failure,
+                    "observer_cleanup": cleanup}
+
+        uid, gid = self._trial_user
+        raw = run_rope_layout_probe(
+            python=self._python, source_root=self._source, model_config=self._model / "config.json",
+            workload=workload, profile=profile, revision=revision["id"],
+            workspace=self._session / "workspaces" / f"{attempt}-rope-worker",
+            environment=self._env, uid=uid, gid=gid, observed_layouts=observation["layouts"],
+        )
+        return {**raw, "observation": observation, "observer_cleanup": cleanup}
+
     def prepare(self, revision: str, workspace: Path, *, kind: str) -> Record:
-        if revision not in self._stacks or kind not in {"framework", "model_forward"}:
-            raise BackendError("real SGLang prepare requires a bound framework or model-forward revision")
+        if revision not in self._stacks or kind not in {"framework", "model_forward", "rope_layout"}:
+            raise BackendError("real SGLang prepare requires a bound revision and supported measurement kind")
         if kind == "model_forward" and self._forward_repeats is None:
             raise BackendError("real SGLang model-forward measurement is not enabled")
+        if kind == "rope_layout" and not self._rope_layout_probe:
+            raise BackendError("real SGLang RoPE layout measurement is not enabled")
         if self._child is not None:
             raise BackendError("an earlier SGLang instance still needs cleanup")
         workspace = workspace.resolve()
@@ -546,6 +654,11 @@ class SGLangBackend:
         if kind == "model_forward":
             patches.append(forward_source_edit())
             allowed_source |= {FORWARD_SOURCE}
+        elif kind == "rope_layout":
+            from .sglang_rope import ROPE_MODEL_SOURCE, rope_layout_source_edit
+
+            patches.append(rope_layout_source_edit())
+            allowed_source |= {ROPE_MODEL_SOURCE}
         if patches:
             commit = self._source_revision()
             if commit != self._target.get("software", {}).get("sglang_commit"):
@@ -596,8 +709,14 @@ class SGLangBackend:
         log = workspace / "server.log"
         args, chunk = _chunk_args(self._server_args, stack["parameters"].get("chunked_prefill_size"))
         forward_only = prepared["kind"] == "model_forward"
-        if forward_only and "--disable-cuda-graph" not in args:
-            args.append("--disable-cuda-graph")
+        graph_expected = {}
+        if "decode_graph_enabled" in stack["parameters"]:
+            decode_graph = stack["parameters"]["decode_graph_enabled"]
+            if forward_only and decode_graph:
+                raise BackendError("model-forward timing requires decode graph to stay disabled")
+            args, graph_expected = _decode_graph_args(args, decode_graph)
+        if forward_only and _DISABLE_GRAPH not in args:
+            args.append(_DISABLE_GRAPH)
         command = [str(self._python), "-u", "-m", "sglang.launch_server", "--host", _HOST, "--port", str(port),
                    "--model-path", str(self._model), "--tokenizer-path", str(self._tokenizer),
                    "--served-model-name", model_name, "--device", "npu", "--attention-backend", "ascend",
@@ -619,6 +738,10 @@ class SGLangBackend:
             env = {**env, "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "0"}
         if forward_only:
             env = {**env, FORWARD_CONTROL_ENV: str(workspace / "model-forward.window")}
+        elif prepared["kind"] == "rope_layout":
+            from .sglang_rope import ROPE_CONTROL_ENV
+
+            env = {**env, ROPE_CONTROL_ENV: str(workspace / "rope-layout.window")}
         lease = {"nonce": nonce, "state": "launching", "pid": None, "port": port,
                  "revision": revision, "launch_command": command}
         if self._trial_user is not None:
@@ -640,12 +763,15 @@ class SGLangBackend:
             "served_model_name": model_name, "model_path": str(self._model), "tokenizer_path": str(self._tokenizer),
             "host": _HOST, "port": port, "device": "npu", "dtype": "bfloat16", "tp_size": 1,
             "attention_backend": "ascend", "version": probe["environment"]["software"]["sglang"],
+            **graph_expected,
         }
         if chunk is not None:
             expected["chunked_prefill_size"] = chunk
-        if forward_only:
+        if forward_only or prepared["kind"] == "rope_layout":
             expected["disable_cuda_graph"] = True
         loaded = self._wait_ready(base_url, expected, log)
+        if stack["parameters"].get("decode_graph_enabled") is True:
+            _verify_decode_graph_capture(log)
         observed = loaded_sources(log, source) if source else []
         self._active = {
             "mode": "real", "instance_id": nonce, "revision": revision, "loaded_revision": revision,
@@ -663,6 +789,8 @@ class SGLangBackend:
                 "symbol": FORWARD_SYMBOL, "source": FORWARD_SOURCE, "repeats": self._forward_repeats,
                 "graph_replay": False,
             }
+        elif prepared["kind"] == "rope_layout":
+            self._active["rope_layout_observer"] = True
         if stack["kernels"]:
             try:
                 self._active["kernel_log_offset"] = log.stat().st_size
@@ -730,6 +858,8 @@ class SGLangBackend:
         identity = self._observation(instance, workload)
         if instance.get("model_forward"):
             raise BackendError("the isolated model-forward service does not provide end-to-end timing")
+        if instance.get("rope_layout_observer"):
+            raise BackendError("the isolated RoPE layout observer does not provide end-to-end timing")
         results = benchmark(instance["base_url"], workload, repeat=repeat, warmup=warmup, timeout=self._request_timeout)
         self._observation(instance, workload)
         return {**results, **identity}

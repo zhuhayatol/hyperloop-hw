@@ -36,6 +36,10 @@ def after_sweep(
     state: dict[str, Any],
     settings: dict[str, Any],
     budget: int,
+    *,
+    goal_driven: bool = False,
+    goal_passed: bool = False,
+    new_direction: bool = False,
 ) -> tuple[str, str]:
     sweep = state["last_conc_sweep"] or {}
     if sweep.get("status") in ("failed", "partial"):
@@ -43,7 +47,7 @@ def after_sweep(
     baseline = state.get("baseline") or {}
     original = service_throughput(baseline)
     current = service_throughput(state.get("current_revision") or {})
-    if original and current and current / original >= 1 + settings["target_gain_pct"] / 100:
+    if goal_passed or (not goal_driven and original and current and current / original >= 1 + settings["target_gain_pct"] / 100):
         return "CLOSE", "target_reached"
     if not settings["framework_enabled"]:
         return "CLOSE", "framework_disabled"
@@ -51,7 +55,7 @@ def after_sweep(
         return "CLOSE", "budget_exhausted"
     if state["cycle"] >= settings["max_cycles"]:
         return "CLOSE", "cycle_limit"
-    if sweep.get("reason") == "no_validated_change_since_sweep":
+    if sweep.get("reason") == "no_validated_change_since_sweep" and not new_direction:
         return "CLOSE", "converged"
     return "FRAMEWORK_AGENT", "continue_from_accepted_revision"
 
